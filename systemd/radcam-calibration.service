@@ -1,0 +1,28 @@
+[Unit]
+Description=Apply the camera module's stored calibration to the libcamera tuning
+Documentation=file:/home/rad/driver-dev/CLAUDE.md
+# The tuning file has to be correct *before* anything opens the camera, so this
+# runs to completion first and everything that captures is ordered after it.
+After=local-fs.target
+Wants=local-fs.target
+Before=radcamd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/python3 -m radcam.calibration --any-bus
+WorkingDirectory=/opt/radcam
+Environment=PYTHONPATH=/opt/radcam
+Environment=PYTHONUNBUFFERED=1
+
+# Needs /dev/i2c-* to read the EEPROM and write access to the installed tuning
+# file under /usr/local.
+User=root
+
+# An uncalibrated camera is not a boot failure - it just looks worse. Never
+# block the rest of the system on it.
+SuccessExitStatus=0
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target

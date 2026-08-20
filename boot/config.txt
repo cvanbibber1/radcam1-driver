@@ -1,0 +1,103 @@
+# For more options and information see
+# http://rptl.io/configtxt
+# Some settings may impact device functionality. See link above for details
+
+# Uncomment some or all of these to enable the optional hardware interfaces
+#dtparam=i2c_arm=on
+#dtparam=i2s=on
+#dtparam=spi=on
+
+# Enable audio (loads snd_bcm2835)
+dtparam=audio=on
+
+# Additional overlays and parameters are documented
+# /boot/firmware/overlays/README
+
+# Automatically load overlays for detected cameras
+# radcam: disabled — this board carries a custom AR1335 module that firmware
+# auto-detection does not know about; its overlay is loaded explicitly below.
+camera_auto_detect=0
+
+# Automatically load overlays for detected DSI displays
+display_auto_detect=1
+
+# Automatically load initramfs files, if found
+auto_initramfs=1
+
+# Enable DRM VC4 V3D driver
+dtoverlay=vc4-kms-v3d
+max_framebuffers=2
+
+# Don't have the firmware create an initial video= setting in cmdline.txt.
+# Use the kernel's default instead.
+disable_fw_kms_setup=1
+
+# Run in 64-bit mode
+arm_64bit=1
+
+# Disable compensation for displays with overscan
+disable_overscan=1
+
+# Run as fast as firmware / board allows
+arm_boost=1
+
+[cm4]
+# Enable host mode on the 2711 built-in XHCI USB controller.
+# This line should be removed if the legacy DWC2 controller is required
+# (e.g. for USB device mode) or if USB support is not required.
+otg_mode=1
+
+[cm5]
+dtoverlay=dwc2,dr_mode=host
+
+[pi5]
+dtoverlay=nospi10
+
+[all]
+
+# --- radcam AR1335 bring-up -------------------------------------------------
+# Camera I2C: CAM0 connector -> i2c-6, CAM1 connector -> i2c-4.
+# Both are enabled so the module is found in whichever port it is plugged into.
+dtparam=i2c_csi_dsi0=on
+dtparam=i2c_csi_dsi1=on
+
+# Dosimeter (LTC2485) lives on the 40-pin header I2C, GPIO2/GPIO3 -> i2c-1.
+dtparam=i2c_arm=on
+
+# Sensor ENABLE is on connector GPIO1 (IO1), not IO0 as on stock Pi wiring.
+# Move the camera regulators onto the pins this board actually uses:
+#   CAM0 IO1 = RP1 line 35, CAM1 IO1 = RP1 line 48.
+dtparam=cam0_reg_gpio=35
+dtparam=cam1_reg_gpio=48
+
+# AR1335 on both connectors, so the module works in whichever port it is in.
+# The port with no camera simply fails to probe.
+#
+# extclk: the AR1335 has no internal oscillator and stays mute on I2C without a
+# 24 MHz EXTCLK. The Pi's camera connector carries no clock, so this routes RP1
+# GPCLK3 out of connector GPIO0 (unused on this board) to supply one. Harmless
+# if the module turns out to have its own oscillator.
+#
+# If the module turns out to have no oscillator of its own, the Pi can supply
+# EXTCLK on connector GPIO0 by adding `,extclk` to both lines below plus:
+#     gpio=34=a1     # CAM0 IO0 -> GPCLK3
+#     gpio=46=a0     # CAM1 IO0 -> GPCLK3
+# Tried on 2026-08-10: the clock enables at 24 MHz but does not reach the pad,
+# and the sensor stayed silent, so it is left off. See DEVELOPMENT_STATE.md.
+# The camera lives on CAM1. The CAM0 instance costs nothing - it simply fails
+# to probe - and keeps the system working if the module is ever moved.
+#
+# NOTE: do NOT add `i2c_slow` here. It was a bring-up experiment; at 10 kHz the
+# ~309-register mode table takes over a second to write and the CSI front end
+# times out waiting for frames.
+dtoverlay=ar1335
+dtoverlay=ar1335,cam0
+
+# Illumination LEDs: TPS922051 dimmed by PWM0_CHAN2 on GPIO18.
+# Brightness is capped to 10% in software by radcam/led.py.
+dtoverlay=radcam-led
+
+# Flight comms: ADM2582E RS422 transceiver on uart0, GPIO14 (TXD) / GPIO15 (RXD).
+# This is separate from the Pi 5 debug UART, which stays on /dev/ttyAMA10.
+dtparam=uart0=on
+# --- end radcam -------------------------------------------------------------

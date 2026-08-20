@@ -1,0 +1,34 @@
+# Vendored upstream sources, fetched not authored. libcamera-src is 45 MB of
+# the Raspberry Pi libcamera tree; rpi-utils is their tools repo. Both are
+# reproducible from their own remotes and would dwarf this project's history.
+libcamera-src/
+rpi-utils/
+
+# Test captures: 193 MB of raw frames and DNGs from calibration runs. The
+# calibration *results* live on the camera EEPROM, which is the thing that
+# actually has to survive; the frames that produced them do not.
+captures/
+
+# Captured run output, including config backups made before edits.
+logs/
+
+# Build products
+__pycache__/
+*.py[cod]
+*.ko
+*.o
+*.mod
+*.mod.c
+*.cmd
+*.symvers
+*.order
+.tmp_versions/
+*.dtbo
+
+# Compiled PIO/softuart binaries. Sources are alongside them; rebuild with
+# the Makefile rather than tracking aarch64 ELFs.
+softuart/pio_uart
+softuart/pio_uart_rx
+softuart/pio_uart_bridge
+softuart/softuart
+softuart/pio_clock

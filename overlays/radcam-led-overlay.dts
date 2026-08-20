@@ -1,0 +1,40 @@
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * Illumination LED driver for radcam1.
+ *
+ * A TPS922051D1DSGR constant-current LED driver is dimmed by PWM on GPIO18.
+ * On the Pi 5 that pin is PWM0_CHAN2, so this enables the RP1 PWM0 block and
+ * muxes GPIO18 to it. The channel then appears as channel 2 of the pwmchip
+ * exported under /sys/class/pwm.
+ *
+ * The 10% brightness cap the mission requires is enforced in software, by
+ * radcam/led.py - the hardware here is capable of full scale, so nothing may
+ * drive it except through that class.
+ */
+
+/dts-v1/;
+/plugin/;
+
+/{
+	compatible = "brcm,bcm2712";
+
+	fragment@0 {
+		target = <&rp1_gpio>;
+		__overlay__ {
+			radcam_led_pins: radcam_led_pins {
+				function = "pwm0";
+				pins = "gpio18";
+				bias-disable;
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&rp1_pwm0>;
+		__overlay__ {
+			pinctrl-names = "default";
+			pinctrl-0 = <&radcam_led_pins>;
+			status = "okay";
+		};
+	};
+};

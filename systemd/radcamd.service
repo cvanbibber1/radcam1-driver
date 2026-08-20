@@ -1,0 +1,32 @@
+[Unit]
+Description=radcam1 telemetry and housekeeping daemon
+Documentation=file:/home/rad/driver-dev/DEVELOPMENT_STATE.md
+After=local-fs.target
+Wants=local-fs.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/python3 -m radcam.daemon /etc/radcam/config.json
+WorkingDirectory=/opt/radcam
+Environment=PYTHONPATH=/opt/radcam
+Environment=PYTHONUNBUFFERED=1
+
+# Root is required for /sys/class/pwm, /dev/i2c-1 and /dev/ttyAMA0.
+User=root
+
+# Zero intervention: always come back, and let systemd kill us if the loop
+# wedges. The daemon pets the watchdog once per cycle.
+Restart=always
+RestartSec=5
+WatchdogSec=60
+
+# Keep restarting forever rather than giving up after N tries - there is nobody
+# to press the button.
+StartLimitIntervalSec=0
+
+# The calibration store must survive reboots.
+StateDirectory=radcam
+
+[Install]
+WantedBy=multi-user.target
