@@ -71,6 +71,10 @@ TIOCSER_TEMT = 0x01
 #: polling TEMT. Covers scheduler jitter without spinning for long.
 _POLL_MARGIN_S = 500e-6
 
+#: Slice length when an abort check is armed. Bounds how long a stop-with-loss
+#: waits to take effect, at the cost of a wake-up per millisecond of packet.
+_ABORT_POLL_S = 1e-3
+
 
 def _busy_wait(seconds: float) -> None:
     """Spin for sub-millisecond intervals that sleep() cannot resolve."""
@@ -171,6 +175,8 @@ class Rs422Link:
         self.tx_packets = 0
         self.tx_bytes = 0
         self.tx_errors = 0
+        #: Transmissions cut short by a stop-with-loss.
+        self.tx_aborted = 0
         #: Counts transmissions where TEMT did not assert in time and the
         #: guard expired instead. Non-zero means DE timing is being estimated.
         self.tx_drain_timeouts = 0
@@ -220,7 +226,8 @@ class Rs422Link:
                           struct.pack("I", 0))
         return bool(struct.unpack("I", raw)[0] & TIOCSER_TEMT)
 
-    def _await_transmission(self, nbytes: int, started: float) -> None:
+    def _await_transmission(self, nbytes: int, started: float,
+                            abort_check=None) -> bool:
         """Return as close as possible to the last stop bit leaving the pin.
 
         `started` is the instant just before `write()` was called, and it has
@@ -235,14 +242,31 @@ class Rs422Link:
         if not self._have_lsr:
             self._serial.flush()               # tcdrain: correct but coarse
             _busy_wait(self.guard_s)
-            return
+            return False
 
         # Sleep through whatever is left of the transmission rather than
         # spinning; the payload is power-minimised and a 1288-byte packet is
         # 14 ms. Most of it has usually already elapsed inside write().
-        remaining = (started + wire_s - _POLL_MARGIN_S) - time.perf_counter()
-        if remaining > 0:
-            time.sleep(remaining)
+        deadline_sleep = started + wire_s - _POLL_MARGIN_S
+        if abort_check is None:
+            remaining = deadline_sleep - time.perf_counter()
+            if remaining > 0:
+                time.sleep(remaining)
+        else:
+            # Sleep in slices so an abort is acted on within a millisecond
+            # rather than at the end of a 14 ms packet.
+            while True:
+                remaining = deadline_sleep - time.perf_counter()
+                if remaining <= 0:
+                    break
+                time.sleep(min(remaining, _ABORT_POLL_S))
+                try:
+                    if abort_check():
+                        self.abort_tx()
+                        return True
+                except Exception as exc:               # noqa: BLE001
+                    log.error("abort check failed: %s", exc)
+                    break
 
         # Then poll for the shift register to clear. Bounded, so a driver that
         # never asserts TEMT cannot wedge the transmit path.
@@ -250,17 +274,18 @@ class Rs422Link:
         while time.perf_counter() < deadline:
             try:
                 if self._transmitter_empty():
-                    return
+                    return False
             except OSError:
                 # The ioctl worked at open and has stopped working; fall back
                 # rather than spin to the deadline on every packet from now on.
                 self._have_lsr = False
                 self._serial.flush()
                 _busy_wait(self.guard_s)
-                return
+                return False
         self.tx_drain_timeouts += 1
         log.warning("transmitter-empty not seen within deadline for %d bytes",
                     nbytes)
+        return False
 
     def close(self) -> None:
         try:
@@ -318,18 +343,48 @@ class Rs422Link:
             log.error("RS-422 read failed: %s", exc)
             return b""
 
-    def send(self, data: bytes) -> bool:
-        """Transmit one packet with DE asserted for exactly its duration."""
+    def abort_tx(self) -> None:
+        """Cut a transmission short, mid-packet.
+
+        Everything still queued in the kernel is discarded and DE drops
+        immediately. Up to a FIFO's worth of bytes - about 32, or 350 us at
+        921600 - may already be past the point of recall, so this is not
+        instantaneous to the bit. What it guarantees is that the packet does
+        not finish: the receiver sees a truncated frame, fails its CRC, and
+        drops it. That is precisely the outcome "stop with loss" describes.
+        """
+        try:
+            self._serial.reset_output_buffer()
+        except Exception:                              # noqa: BLE001
+            pass
+        self.de.set(False)
+        self.tx_aborted += 1
+
+    def send(self, data: bytes, abort_check=None) -> bool:
+        """Transmit one packet with DE asserted for exactly its duration.
+
+        `abort_check` is polled while the packet drains. If it ever returns
+        True the transmission is cut short and this returns False, leaving the
+        caller to decide what to do about the chunk that did not make it.
+
+        Hearing DICE while we transmit depends on the transceiver's receiver
+        being enabled during transmit. The ADM2582E is full duplex - separate
+        driver and receiver pairs - so with /RE tied active this works. If /RE
+        is instead tied to DE the payload is deaf while transmitting, the check
+        never fires, and an abort takes effect at the next packet boundary
+        instead. That is a wiring question, not a software one.
+        """
         if not self.is_open or not data:
             return False
 
+        aborted = False
         try:
             self.de.set(True)
             # Let the isolated driver's outputs settle before the start bit.
             _busy_wait(self.setup_s)
             started = time.perf_counter()
             self._serial.write(data)
-            self._await_transmission(len(data), started)
+            aborted = self._await_transmission(len(data), started, abort_check)
         except Exception as exc:                       # noqa: BLE001
             self.tx_errors += 1
             log.error("RS-422 write failed: %s", exc)
@@ -338,10 +393,13 @@ class Rs422Link:
             # Never leave the bus driven, whatever went wrong above.
             self.de.set(False)
 
+        if aborted:
+            return False
+
         self.tx_packets += 1
         self.tx_bytes += len(data)
 
-        if self.discard_echo:
+        if self.discard_echo and abort_check is None:
             # If /RE is not tied to DE the transceiver hears our own
             # transmission. DICE is the master and does not talk while we
             # answer, so anything sitting in the input buffer now is echo.
@@ -353,5 +411,5 @@ class Rs422Link:
 
     def stats(self) -> dict[str, int]:
         return {"tx_packets": self.tx_packets, "tx_bytes": self.tx_bytes,
-                "tx_errors": self.tx_errors,
+                "tx_errors": self.tx_errors, "tx_aborted": self.tx_aborted,
                 "tx_drain_timeouts": self.tx_drain_timeouts}

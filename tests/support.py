@@ -73,6 +73,7 @@ class MemoryLink:
         self.to_dice = bytearray()
         self.tx_packets = 0
         self.tx_errors = 0
+        self.tx_aborted = 0
         self.fail_next = 0
 
     # experiment side
@@ -84,11 +85,24 @@ class MemoryLink:
     def read_wait(self, timeout_s: float = 0.005, size: int = 8192) -> bytes:
         return self.read(size)
 
-    def send(self, data: bytes) -> bool:
+    def send(self, data: bytes, abort_check=None) -> bool:
+        """Mirrors `Rs422Link.send`, including the mid-packet abort check.
+
+        The abort path is polled once here rather than repeatedly: there is no
+        real transmission to interrupt, so one check is enough to exercise the
+        decision without inventing a fake drain.
+        """
         if self.fail_next:
             self.fail_next -= 1
             self.tx_errors += 1
             return False
+        if abort_check is not None:
+            try:
+                if abort_check():
+                    self.tx_aborted += 1
+                    return False
+            except Exception:                          # noqa: BLE001
+                pass
         self.to_dice += data
         self.tx_packets += 1
         return True

@@ -1,6 +1,6 @@
 # Development State
 
-**Last updated:** 2026-08-20 — **RS-422 VERIFIED; LIVE VIDEO OVER HRT WORKING**
+**Last updated:** 2026-08-20 — **SLOTS, HEX COMMAND SET, BOTH HRT STOPS**
 **Read `CLAUDE.md` first** for the stable hardware map, `docs/stp/README.md`
 for the RS-422 interface, and `HANDOFF.md` for blocked work.
 
@@ -22,14 +22,44 @@ python3 -m unittest discover -s tests -t .      # 125 tests
 
 | Check | Result |
 |---|---|
-| Unit tests | **176 pass** |
+| Unit tests | **217 pass** |
 | Reliability / safety / autonomy | **85/85 pass** |
 | Simulator conversation | **21/21 pass** |
+| Command hex strings accepted | **39/39** |
 | Live video, camera to decoded frames | **15.0 fps, 584 kbit/s, 0 CRC failures** |
 | End-to-end through a real tty (PTY) | 49-chunk 61440 B file, bit-exact, CRC match |
 | DE assertion excess | **~30 µs flat**, any packet size |
 | Sustained HRT | **89.2 kB/s payload, 99.7% wire utilisation** |
 | Idle CPU | 0.85% |
+
+### Added 2026-08-20 (second pass)
+
+- **Storage slots** (`radcam/slots.py`). 16 numbered slots, each holding one
+  image or video, with an explicit capture / download / delete lifecycle. Fixed
+  addresses are what make a canned hex command possible. CRC-32 per slot,
+  TMR-protected index, and an interrupted recording leaves its slot free.
+- **Command set as hex strings** (`radcam/stp/catalogue.py`,
+  `tools/stp-command.py`). 35 commands and 4 request packets render as complete
+  pasteable packets; `--verify` proves all 39 are accepted by a real decoder.
+  The user guide's reference is generated from the same table, so it cannot
+  drift from the code.
+- **Both HRT stops implemented properly.** 0x85 lets the packet in flight
+  finish; 0x86 truncates it via `Rs422Link.abort_tx()`, polled every
+  millisecond while a packet drains. A truncated file chunk is rewound by
+  exactly one; a truncated video frame is dropped as stale.
+- **Metrics** (`tools/stp-metrics.py`). Link arithmetic, transfer times, stream
+  budget, latency model, plus measured UART and encoder performance.
+
+### The metric that changed a decision
+
+At 640x480, 15 fps, 600 kbit/s the stream occupies **92% of every frame
+interval**, with keyframes bursting to **231%** — absorbed by the frame ring
+because the mean is under 100%. Asking for 700 kbit/s at that size exceeds the
+link outright (105%) and just produces dropped frames.
+
+Tightening the encoder's VBV buffer from 2x bitrate to 0.5x brought delivered
+rate from 640 to 611 kbit/s against a 600 kbit/s request, and mean occupancy
+from 98.4% to 92%.
 
 ### Mission parameters confirmed 2026-08-20
 
@@ -89,12 +119,10 @@ convention rather than a 30-site rewrite — see `docs/stp/README.md`.
 
 ### Still assumed, not confirmed
 
-1. ~~Target ID~~ — **assigned: 0xC7.**
-2. **Stop-with-loss (0x86) semantics are a guess** — the ICD names it but does
-   not define it. Implemented as stop + rewind one chunk; explicit RESEND is
-   the authoritative recovery path and does not depend on the guess.
-3. **Initial HRT state assumed disabled.** Conservative; the ICD is silent.
-4. **Never tested against real DICE hardware.**
+1. **Never tested against real DICE hardware.** Everything else the ICD left
+   open has been settled by the mission: byte order, CRC variant and position,
+   target ID (0xC7), epoch, baud, DE pin, both stop semantics, and the initial
+   HRT state (stop).
 
 ---
 

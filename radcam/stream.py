@@ -238,7 +238,12 @@ class VideoStream:
             "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
             "-x264-params", params,
             "-b:v", str(cfg.bitrate), "-maxrate", str(cfg.bitrate),
-            "-bufsize", str(cfg.bitrate * 2),
+            # Half a second of VBV, not the two seconds ffmpeg defaults to.
+            # A loose buffer lets keyframes spike: measured at 2x bitrate, the
+            # encoder delivered 640 kbit/s against a 600 kbit/s request and the
+            # worst keyframe needed 189% of a frame interval to transmit. The
+            # link cannot absorb that burst, so it becomes dropped frames.
+            "-bufsize", str(max(cfg.bitrate // 2, 50_000)),
             "-bf", "0",              # no B-frames: they only add latency here
             "-f", "h264", "-",
         ]

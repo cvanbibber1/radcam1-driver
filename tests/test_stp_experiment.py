@@ -227,18 +227,114 @@ class TestHrtFlowControl(ExperimentFixture):
         self.assertEqual(zlib.crc32(blob[:info["size"]]) & 0xFFFFFFFF,
                          info["file_crc32"])
 
-    def test_stop_with_loss_rewinds_the_send_pointer(self):
-        self.request_media(3)          # too large to finish in one pass
+    def test_plain_stop_halts_hrt_without_losing_a_chunk(self):
+        """0x85 lets the packet in flight finish, so nothing is rewound."""
+        self.request_media(3)
         self.send_short(P.PacketType.HRT_GO)
         self.experiment.service()
         advanced = self.experiment.transfers.status()["xfer_chunk_next"]
         self.assertGreater(advanced, 0)
 
-        self.send_short(P.PacketType.HRT_STOP_WITH_LOSS)
+        self.send_short(P.PacketType.HRT_STOP)
         self.experiment.service()
+        self.assertFalse(self.experiment._hrt_enabled.value())
         self.assertEqual(self.experiment.transfers.status()["xfer_chunk_next"],
-                         advanced - 1)
-        self.assertEqual(self.experiment.transfers.loss_events, 1)
+                         advanced)
+
+    def test_stop_with_loss_aborts_the_packet_in_flight(self):
+        """0x86 cuts the transmission short, so that chunk goes again."""
+        self.request_media(3)
+        self.send_short(P.PacketType.HRT_GO)
+        self.experiment.service()
+        advanced = self.experiment.transfers.status()["xfer_chunk_next"]
+        self.link.dice_read()
+
+        # Arrives while a packet is draining, which is the case the abort
+        # check exists for: the pump sees it partway through a transmission.
+        self.send_short(P.PacketType.HRT_STOP_WITH_LOSS)
+        self.experiment._pump_hrt()
+
+        self.assertEqual(self.link.tx_aborted, 1)
+        # The pump took chunk N and the send was cut short, so the pointer went
+        # N -> N+1 -> N. Ending where it started is the rewind working: the
+        # truncated chunk is still owed.
+        self.assertEqual(self.experiment.transfers.status()["xfer_chunk_next"],
+                         advanced,
+                         "the truncated chunk should still be owed")
+
+        # And it really is sent again when the tap reopens.
+        self.link.dice_read()
+        self.send_short(P.PacketType.HRT_GO)
+        self.experiment.service()
+        first = next(H.decode_hrt_payload(raw[6:6 + 1280])
+                     for kind, raw in self.replies() if kind == "HRT")
+        self.assertEqual(first["chunk_index"], advanced,
+                         "the chunk truncated by the abort was skipped")
+
+    def test_both_stops_halt_hrt_immediately(self):
+        for stop in (P.PacketType.HRT_STOP, P.PacketType.HRT_STOP_WITH_LOSS):
+            with self.subTest(hex(stop)):
+                self.send_short(P.PacketType.HRT_GO)
+                self.experiment.service()
+                self.assertTrue(self.experiment._hrt_enabled.value())
+                self.send_short(stop)
+                self.experiment.service()
+                self.link.dice_read()
+                self.assertFalse(self.experiment._hrt_enabled.value())
+                for _ in range(3):
+                    self.experiment.service()
+                self.assertEqual(self.link.dice_read(), b"",
+                                 "HRT continued after a stop")
+
+    def test_hrt_starts_disabled(self):
+        """Nothing may be transmitted until DICE explicitly says Go."""
+        self.assertFalse(self.experiment._hrt_enabled.value())
+        self.assertEqual(self.poll_lrt()["hrt_enabled"], False)
+
+    def test_an_aborted_stream_frame_is_dropped_not_resent(self):
+        """A video frame that missed its moment is worthless."""
+        from radcam.stream import EncodedFrame
+        import time as _time
+
+        class _S:
+            config = __import__("radcam.stream", fromlist=["StreamConfig"]).StreamConfig()
+            running = True
+            fault = None
+            frames_encoded = 1
+            frames_dropped = 0
+            frames_taken = 0
+            bytes_encoded = 0
+
+            def __init__(self):
+                self.frames = [EncodedFrame(0, b"K" * 4000, True, _time.monotonic())]
+
+            def take(self):
+                return self.frames.pop(0) if self.frames else None
+
+            def flush(self, keep_keyframe=False):
+                n = len(self.frames)
+                self.frames.clear()
+                return n
+
+            def encoder_late(self):
+                return False
+
+            @property
+            def queue_depth(self):
+                return len(self.frames)
+
+            def status(self):
+                return {}
+
+        self.experiment.stream = _S()
+        self.send_short(P.PacketType.HRT_GO)
+        self.experiment.service()
+        self.link.dice_read()
+
+        self.send_short(P.PacketType.HRT_STOP_WITH_LOSS)
+        self.experiment._pump_hrt()
+        self.assertIsNone(self.experiment._stream_frame,
+                          "a truncated video frame should be abandoned")
 
     def test_resend_after_completion_is_honoured(self):
         self.request_media(2)                    # single-chunk file

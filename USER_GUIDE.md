@@ -193,7 +193,19 @@ Three things travel over it:
   data ever travels on LRT.
 - **HRT** (high rate telemetry) carries **live video** and **chunked file
   transfer** of stored media. It only flows between an `HRT Go` and a `Stop`
-  from DICE.
+  from DICE, and **starts closed** after every reset — nothing bulk is
+  transmitted until the master explicitly asks.
+
+The two stops differ only in what happens to a packet already going out:
+
+| | Effect |
+|---|---|
+| `HRT_STOP` (0x85) | lets the packet in flight finish, then sends no more |
+| `HRT_STOP_WITH_LOSS` (0x86) | cuts the transmission short — the receiver sees a truncated frame, fails its CRC and discards it |
+
+Neither buffers anything. After a stop-with-loss, a truncated **file** chunk is
+sent again when the tap reopens; a truncated **video** frame is abandoned,
+because by then it is stale.
 
 ### Trying it without a flight computer
 
@@ -248,6 +260,23 @@ a delay that only grows, and ten-minute-old video is worse than none. Live
 video takes priority over file transfer on HRT; file chunks use the gaps
 between frames, so a transfer alongside a stream still makes progress.
 
+**600 kbit/s at 640×480 and 15 fps is close to the ceiling.** Measured link
+occupancy is 92% of every frame interval, leaving 8% for telemetry and
+commands. Keyframes burst to 231% of one interval — about 2.3 frames' worth —
+which the frame ring absorbs and then catches up on, because the mean is below
+100%. Asking for 700 kbit/s at that size and rate exceeds the link outright
+(105%) and simply produces dropped frames. For more margin, drop to 10 fps at
+the same bitrate (84%) or lower the bitrate.
+
+Check any combination before committing to it:
+
+```bash
+python3 tools/stp-metrics.py                 # arithmetic, no hardware needed
+sudo systemctl stop radcamd
+sudo python3 tools/stp-metrics.py --all      # measured link and encoder
+sudo systemctl start radcamd
+```
+
 ### Pointing the camera without moving it
 
 The sensor is 4208x3120 but the link carries only ~600 kbit/s. Streaming the
@@ -264,6 +293,42 @@ optical detail of just the area you care about. A crop larger than the output
 is scaled down, giving a wider view with less detail. Everything is clamped to
 the sensor and echoed back in telemetry, so a box asked for near the edge comes
 back as the box actually applied.
+
+### Storage slots
+
+Captures do not go to an auto-numbered media store — they go into **numbered
+slots**. There are 16 by default, and each holds one image or one video. Slot 3
+is slot 3 whatever happened before, which is what makes a canned command
+possible: a stored hex string that captures into slot 3 and another that
+downloads slot 3 mean the same thing on every pass.
+
+The lifecycle is explicit, and deletion is what frees space:
+
+```
+SLOT_CAPTURE_IMAGE slot=3     take a still into slot 3
+SLOT_RECORD_START  slot=4     record video into slot 4, held on the Pi
+SLOT_RECORD_STOP              finish it
+SLOT_LIST                     what is in every slot
+SLOT_DOWNLOAD      slot=3     queue it for HRT
+SLOT_DELETE        slot=3     free the slot for the next experiment
+```
+
+Recording is **not** streaming: `SLOT_RECORD_START` writes video to the Pi's
+storage for later transfer, and nothing goes over the link until you download
+it. Give it a duration and it stops by itself, so the ground does not have to
+be in contact:
+
+```
+SLOT_RECORD_START slot=4 seconds=30
+```
+
+Every slot carries a CRC-32 taken when it was written and checked when it is
+read, so a file that rotted in storage is reported as a fault rather than
+discovered after minutes of downlink. Telemetry reports slots used, slots free,
+bytes held, which slot is recording and which is downloading.
+
+A recording interrupted by a power loss leaves its slot **free**, not
+half-occupied — nothing was finalised, so there is nothing to keep.
 
 ### Getting a stored file down
 
@@ -341,6 +406,8 @@ The keys that matter most:
 | `stream.centre_x`, `stream.centre_y` | sensor pixel the crop box is centred on |
 | `stream.crop_w`, `stream.crop_h` | crop size; equal to output means native pixels |
 | `stream.queue_frames` | frames buffered before the oldest is dropped |
+| `slot_count` | storage slots, default 16 |
+| `slot_dir` | where slot contents live, default `/var/lib/radcam/slots` |
 
 > With `stp.enabled` true, the flight port belongs to the RS-422 link and the
 > readable ASCII beacon goes only to the debug mirror on GPIO23/24. This is
@@ -352,9 +419,10 @@ The keys that matter most:
 ## 8. Testing and verification
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 176 tests, ~17 s
+python3 -m unittest discover -s tests -t .   # 217 tests, ~19 s
 python3 tools/stp-verify.py                  # 85 reliability/safety/autonomy checks
 python3 tools/stp-sim.py --self-test         # 21 protocol checks
+python3 tools/stp-command.py --verify        # 39 command hex strings
 ```
 
 `stp-verify.py` is the adversarial one: it fuzzes the receiver with random
@@ -379,6 +447,9 @@ with
 | Stream will not start | no hardware H.264 on a Pi 5; needs `ffmpeg` with libx264 present |
 | `stream_frames_dropped` climbing | normal under load — the link or encoder cannot keep up, so stale frames are discarded by design |
 | Video decodes as garbage | you started reading mid-stream; begin at a frame flagged as a keyframe |
+| No free slots | download what you need, then `SLOT_DELETE` — deletion is what frees space |
+| Slot download refused with code 10 | the stored file failed its CRC-32; the bytes rotted, recapture |
+| A canned command runs only once | it was generated with `--no-force`; regenerate without that flag |
 | Colours wrong, greys fine | something spectral, not gain — check for filters or tape over the sensor |
 | `safe_mode` set in telemetry | five commands failed in a row; check events, then `CLEAR_SAFE_MODE` |
 | Link works then stops | check `rx_bad_crc` and `rx_resyncs` in telemetry |
@@ -389,6 +460,18 @@ payload that has gone quiet is indistinguishable from a dead one.
 ---
 
 ## 10. Every command
+
+### Typical pass
+
+```
+LRT_REQUEST                    # vitals: dose, temperature, slots, link health
+SLOT_CAPTURE_IMAGE slot=0      # take a picture
+SLOT_LIST                      # confirm it landed, see its size
+SLOT_DOWNLOAD slot=0           # queue it
+HRT_GO                         # open the tap, receive it
+HRT_STOP                       # close the tap
+SLOT_DELETE slot=0             # free the slot for next time
+```
 
 ### Daily operation
 
@@ -461,45 +544,371 @@ payload that has gone quiet is indistinguishable from a dead one.
 | `tools/stp-de-timing.py --throughput` | DE assertion timing and link throughput |
 | `tools/stp-crc-solve.py --bin FILE` | recover CRC parameters from captured traffic |
 | `tools/stp-crc-solve.py --demo` | prove the solver works |
-| `tools/stp-verify.py` | 81 reliability, safety and autonomy checks |
+| `tools/stp-command.py --list` | every command that exists |
+| `tools/stp-command.py --all` | every command as a pasteable hex string |
+| `tools/stp-command.py NAME arg=val` | one command with your own arguments |
+| `tools/stp-command.py --verify` | prove every generated string is accepted |
+| `tools/stp-metrics.py` | link arithmetic, transfer times, stream budget |
+| `tools/stp-metrics.py --all` | plus measured UART and encoder performance |
+| `tools/stp-verify.py` | 85 reliability, safety and autonomy checks |
 | `tools/stp-verify.py --suite safety` | one suite only |
 
-### Protocol opcodes — what the spacecraft can ask for
+### Command hex strings
 
-Sent in the 105-byte command payload. Arguments are little-endian.
+Every command is a complete packet — sync, timestamp, type, target, payload and
+CRC — as one hex string you can paste straight into the ground configuration.
+Regenerate any of them, with your own argument values:
 
-| Opcode | Name | Arguments | Effect |
+```bash
+python3 tools/stp-command.py --list                  # what exists
+python3 tools/stp-command.py --all                   # every one, with hex
+python3 tools/stp-command.py SLOT_CAPTURE_IMAGE slot=3
+python3 tools/stp-command.py --verify                # prove they are accepted
+```
+
+Two things about a canned string, both deliberate:
+
+- It carries the **force flag**. The sequence number is baked in, and the
+  payload otherwise treats a repeated sequence number as a retransmission and
+  suppresses it — so without the flag, pasting the same capture command twice
+  would take one picture. With it, ten pastes take ten pictures. Pass
+  `--no-force` if your ground station generates its own sequence numbers and
+  you want retransmission protection instead.
+- Its **timestamp is zero**. Coarse and fine time belong to the master; the
+  payload only echoes them back, and nothing it does depends on the value.
+
+`tools/stp-command.py --verify` feeds all 39 strings to a real decoder and
+confirms each is accepted and dispatched to the opcode it claims — worth
+running after any protocol change, before trusting the table below.
+
+Target ID `0xC7`, CRC-16/CCITT-FALSE, big-endian envelope, `cmd_seq` 1, force flag set.
+
+### Request packets (14 bytes)
+
+| Name | Type | Purpose | Hex |
 |---|---|---|---|
-| `0x01` | `PING` | — | liveness; returns uptime and version |
-| `0x10` | `SET_CONFIG` | key `u8`, value `u32`, repeating | change configuration |
-| `0x11` | `GET_CONFIG` | — | read the effective configuration |
-| `0x20` | `GET_TELEMETRY` | — | housekeeping snapshot |
-| `0x21` | `GET_MEDIA_LIST` | — | stored media: id, type, size, resolution |
-| `0x22` | `GET_DOSE_LOG` | start `f64`, end `f64` (optional) | dose history |
-| `0x30` | `CAPTURE_IMAGE` | — | take one still |
-| `0x31` | `START_RECORD` | — | begin video |
-| `0x32` | `STOP_RECORD` | — | end recording |
-| `0x33` | `CAPTURE_REGION` | x, y, w, h, out_w, out_h — all `u16` | full-res crop, rescaled |
-| `0x40` | `REQUEST_MEDIA` | media id `u32` | queue a file for HRT |
-| `0x41` | `RESEND` | media id `u32`, chunk indices `u32…` | re-send HRT chunks |
-| `0x42` | `DELETE_MEDIA` | media id `u32` | free storage |
-| `0x50` | `SET_LED` | percent `u8` | illumination; clamped to 10% |
-| `0x60` | `EEPROM_READ` | offset `u16`, length `u16` | read calibration bytes |
-| `0x61` | `EEPROM_WRITE` | offset `u16`, length `u16`, data | write; refused unless unlocked |
-| `0x62` | `EEPROM_STATUS` | — | which redundant copies still verify |
-| `0x63` | `EEPROM_REPAIR` | — | rewrite all copies from a good one |
-| `0x70` | `CLEAR_SAFE_MODE` | — | resume normal operation |
-| `0x71` | `ABORT_TRANSFERS` | — | empty the HRT queue |
-| `0x72` | `GET_LINK_STATS` | — | receive counters and resync counts |
-| `0x73` | `SET_HRT_IDLE_FILL` | enable `u8` | send idle HRT packets when nothing is queued |
-| `0x77` | `SET_FEC_GROUP` | group size `u8` | parity group size for HRT transfers; 0 disables |
-| `0x78` | `STREAM_START` | optionally w `u16`, h `u16`, fps `u8`, bitrate `u32`, then cx, cy, cw, ch `u16` | start live video |
-| `0x79` | `STREAM_STOP` | — | stop live video |
-| `0x7A` | `STREAM_SET_REGION` | centre_x, centre_y, crop_w, crop_h — all `u16` | aim the crop box at a sensor pixel |
-| `0x7B` | `STREAM_SET_OUTPUT` | width `u16`, height `u16`, fps `u8`, bitrate `u32` | stream resolution and rate |
+| `LRT_REQUEST` | `0x81` | Poll telemetry; the payload replies with one LRT Data packet | `1ACFFC1D00000000000081C7B03C` |
+| `HRT_GO` | `0x87` | Open the HRT tap - nothing bulk is transmitted until this arrives | `1ACFFC1D00000000000087C71A9A` |
+| `HRT_STOP` | `0x85` | Close the tap, letting the packet in flight finish | `1ACFFC1D00000000000085C77CF8` |
+| `HRT_STOP_WITH_LOSS` | `0x86` | Close the tap immediately, truncating any packet in flight | `1ACFFC1D00000000000086C729AB` |
 
-All four stream commands reply with the **effective** settings after clamping:
-width, height, fps, bitrate, centre_x, centre_y, crop_w, crop_h.
+### Imaging commands
+
+| Name | Opcode | Arguments | Purpose |
+|---|---|---|---|
+| `CAPTURE_IMAGE` | `0x30` | — | Capture into the media store (prefer SLOT_CAPTURE_IMAGE) |
+| `START_RECORD` | `0x31` | — | Record into the media store (prefer SLOT_RECORD_START) |
+| `STOP_RECORD` | `0x32` | — | End a media-store recording |
+| `CAPTURE_REGION` | `0x33` | `x`, `y`, `w`, `h`, `out_w`, `out_h` | Full-resolution capture cropped to a window and rescaled |
+
+<details><summary>Hex strings (defaults shown)</summary>
+
+`CAPTURE_IMAGE` — no arguments
+
+```
+1ACFFC1D00000000000010C730000100013AF30000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`START_RECORD` — no arguments
+
+```
+1ACFFC1D00000000000010C7310001000190A20000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`STOP_RECORD` — no arguments
+
+```
+1ACFFC1D00000000000010C732000100017E700000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`CAPTURE_REGION` — x=1784, y=1320, w=640, h=480, out_w=640, out_h=480
+
+```
+1ACFFC1D00000000000010C73300010C01E69FF80628058002E0018002E001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000CCB4
+```
+
+</details>
+
+### Slots commands
+
+| Name | Opcode | Arguments | Purpose |
+|---|---|---|---|
+| `SLOT_LIST` | `0x64` | — | Every slot: kind, size, dimensions, CRC-32, timestamp |
+| `SLOT_INFO` | `0x65` | `slot` | One slot in detail |
+| `SLOT_CAPTURE_IMAGE` | `0x66` | `slot` | Take a still into a slot, overwriting it |
+| `SLOT_RECORD_START` | `0x67` | `slot`, `seconds` | Record video into a slot; held on the Pi, not streamed |
+| `SLOT_RECORD_STOP` | `0x68` | — | End the recording and finalise its slot |
+| `SLOT_DELETE` | `0x6A` | `slot` | Free one slot for reuse |
+| `SLOT_DELETE_ALL` | `0x6B` | — | Free every slot |
+
+<details><summary>Hex strings (defaults shown)</summary>
+
+`SLOT_LIST` — no arguments
+
+```
+1ACFFC1D00000000000010C76400010001A6C70000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`SLOT_INFO` — slot=0
+
+```
+1ACFFC1D00000000000010C7650001010160BC000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000AAE4
+```
+
+`SLOT_CAPTURE_IMAGE` — slot=0
+
+```
+1ACFFC1D00000000000010C76600010101AE5C000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000841D
+```
+
+`SLOT_RECORD_START` — slot=1, seconds=30
+
+```
+1ACFFC1D00000000000010C76700010301B114011E00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000E526
+```
+
+`SLOT_RECORD_STOP` — no arguments
+
+```
+1ACFFC1D00000000000010C768000100012DEC0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`SLOT_DELETE` — slot=0
+
+```
+1ACFFC1D00000000000010C76A00010101A5BF0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003FF9
+```
+
+`SLOT_DELETE_ALL` — no arguments
+
+```
+1ACFFC1D00000000000010C76B00010001C33E0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+</details>
+
+### Stream commands
+
+| Name | Opcode | Arguments | Purpose |
+|---|---|---|---|
+| `STREAM_START` | `0x78` | `width`, `height`, `fps`, `bitrate`, `centre_x`, `centre_y`, `crop_w`, `crop_h` | Start live video over HRT |
+| `STREAM_STOP` | `0x79` | — | Stop live video |
+| `STREAM_SET_OUTPUT` | `0x7B` | `width`, `height`, `fps`, `bitrate` | Resolution, frame rate and bitrate |
+| `STREAM_SET_REGION` | `0x7A` | `centre_x`, `centre_y`, `crop_w`, `crop_h` | Aim the crop box at a sensor pixel |
+
+<details><summary>Hex strings (defaults shown)</summary>
+
+`STREAM_START` — width=640, height=480, fps=15, bitrate=600000, centre_x=2104, centre_y=1560, crop_w=640, crop_h=480
+
+```
+1ACFFC1D00000000000010C7780001110172308002E0010FC0270900380818068002E001000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004CFE
+```
+
+`STREAM_STOP` — no arguments
+
+```
+1ACFFC1D00000000000010C7790001000183E70000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`STREAM_SET_OUTPUT` — width=640, height=480, fps=15, bitrate=600000
+
+```
+1ACFFC1D00000000000010C77B00010901AB168002E0010FC027090000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000023DA
+```
+
+`STREAM_SET_REGION` — centre_x=2104, centre_y=1560, crop_w=640, crop_h=480
+
+```
+1ACFFC1D00000000000010C77A00010801139E380818068002E00100000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000D9CE
+```
+
+</details>
+
+### Transfer commands
+
+| Name | Opcode | Arguments | Purpose |
+|---|---|---|---|
+| `SLOT_DOWNLOAD` | `0x69` | `slot` | Queue a slot for HRT transfer |
+| `SLOT_DOWNLOAD_ABORT` | `0x6C` | `slot` | Remove a slot from the transfer queue |
+| `ABORT_TRANSFERS` | `0x71` | — | Empty the whole HRT transfer queue |
+| `RESEND` | `0x41` | `media_id`, `chunk` | Re-send specific chunks of a transfer |
+| `GET_MEDIA_LIST` | `0x21` | — | Legacy media store listing |
+| `REQUEST_MEDIA` | `0x40` | `media_id` | Queue a legacy media id for HRT |
+| `DELETE_MEDIA` | `0x42` | `media_id` | Delete legacy media |
+
+<details><summary>Hex strings (defaults shown)</summary>
+
+`SLOT_DOWNLOAD` — slot=0
+
+```
+1ACFFC1D00000000000010C769000101016B5F0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001100
+```
+
+`SLOT_DOWNLOAD_ABORT` — slot=0
+
+```
+1ACFFC1D00000000000010C76C00010101285E000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000620B
+```
+
+`ABORT_TRANSFERS` — no arguments
+
+```
+1ACFFC1D00000000000010C7710001000181CA0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`RESEND` — media_id=1358954496, chunk=0
+
+```
+1ACFFC1D00000000000010C74100010801F1FD000000510000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000A3C6
+```
+
+`GET_MEDIA_LIST` — no arguments
+
+```
+1ACFFC1D00000000000010C7210001000194F80000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`REQUEST_MEDIA` — media_id=1
+
+```
+1ACFFC1D00000000000010C74000010401258E01000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000017D4
+```
+
+`DELETE_MEDIA` — media_id=1
+
+```
+1ACFFC1D00000000000010C74200010401E3E901000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000041CC
+```
+
+</details>
+
+### Link commands
+
+| Name | Opcode | Arguments | Purpose |
+|---|---|---|---|
+| `CLEAR_SAFE_MODE` | `0x70` | — | Resume normal operation after safe mode |
+
+<details><summary>Hex strings (defaults shown)</summary>
+
+`CLEAR_SAFE_MODE` — no arguments
+
+```
+1ACFFC1D00000000000010C770000100012B9B0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+</details>
+
+### Config commands
+
+| Name | Opcode | Arguments | Purpose |
+|---|---|---|---|
+| `GET_CONFIG` | `0x11` | — | Read the effective configuration |
+| `SET_CONFIG` | `0x10` | `key`, `value` | Set one configuration key |
+| `SET_LED` | `0x50` | `percent` | Illumination percent; clamped to 10 |
+| `SET_FEC_GROUP` | `0x77` | `group` | Parity group size for HRT transfers; 0 disables |
+| `SET_HRT_IDLE_FILL` | `0x73` | `enable` | Send idle HRT packets when nothing is queued |
+
+<details><summary>Hex strings (defaults shown)</summary>
+
+`GET_CONFIG` — no arguments
+
+```
+1ACFFC1D00000000000010C7110001000198160000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`SET_CONFIG` — key=6, value=2
+
+```
+1ACFFC1D00000000000010C710000105012E96060200000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000BA3E
+```
+
+`SET_LED` — percent=5
+
+```
+1ACFFC1D00000000000010C750000101015C9405000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000011D4
+```
+
+`SET_FEC_GROUP` — group=16
+
+```
+1ACFFC1D00000000000010C77700010101E34910000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000032CB
+```
+
+`SET_HRT_IDLE_FILL` — enable=0
+
+```
+1ACFFC1D00000000000010C77300010101F7D90000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000004247
+```
+
+</details>
+
+### Telemetry commands
+
+| Name | Opcode | Arguments | Purpose |
+|---|---|---|---|
+| `PING` | `0x01` | — | Liveness check; replies with uptime and version |
+| `GET_TELEMETRY` | `0x20` | — | Housekeeping snapshot in the LRT response window |
+| `GET_LINK_STATS` | `0x72` | — | Receive counters, CRC failures and resync counts |
+| `GET_DOSE_LOG` | `0x22` | — | Dose history; zero range means everything |
+
+<details><summary>Hex strings (defaults shown)</summary>
+
+`PING` — no arguments
+
+```
+1ACFFC1D00000000000010C701000100019C4C0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`GET_TELEMETRY` — no arguments
+
+```
+1ACFFC1D00000000000010C720000100013EA90000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`GET_LINK_STATS` — no arguments
+
+```
+1ACFFC1D00000000000010C772000100016F180000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`GET_DOSE_LOG` — no arguments
+
+```
+1ACFFC1D00000000000010C722000100017A2A0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+</details>
+
+### Eeprom commands
+
+| Name | Opcode | Arguments | Purpose |
+|---|---|---|---|
+| `EEPROM_STATUS` | `0x62` | — | Which redundant calibration copies still verify |
+| `EEPROM_REPAIR` | `0x63` | — | Rewrite every copy from a surviving one |
+| `EEPROM_READ` | `0x60` | `offset`, `length` | Read calibration bytes |
+
+<details><summary>Hex strings (defaults shown)</summary>
+
+`EEPROM_STATUS` — no arguments
+
+```
+1ACFFC1D00000000000010C762000100016B420000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`EEPROM_REPAIR` — no arguments
+
+```
+1ACFFC1D00000000000010C76300010001C1130000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000003810
+```
+
+`EEPROM_READ` — offset=0, length=128
+
+```
+1ACFFC1D00000000000010C76000010401EF5E000080000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000D902
+```
+
+</details>
+
 
 ### Packet types on the wire
 

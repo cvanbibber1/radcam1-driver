@@ -43,6 +43,7 @@ from .stp.experiment import Experiment, ExperimentConfig
 from .stp.link import DeLine, NullDeLine, Rs422Link
 from .stp.lrt import EventCode, EventLog
 from .stp.packets import Wire
+from .slots import DEFAULT_SLOTS, SlotStore
 from .stream import StreamConfig, VideoStream
 
 log = logging.getLogger("radcamd")
@@ -221,6 +222,7 @@ class Daemon:
         self.stp: Experiment | None = None
         self.stp_link: Rs422Link | None = None
         self.stream: VideoStream | None = None
+        self.slots: SlotStore | None = None
         self.stp_events = EventLog()
         self._stp_thread = None
         self._stp_state: dict = {}
@@ -280,10 +282,16 @@ class Daemon:
                 crop_h=int(stream_cfg.get("crop_h", 480))),
             queue_frames=int(stream_cfg.get("queue_frames", 8)))
 
+        # Numbered slots, so a canned command from the ground addresses the
+        # same place every time regardless of capture history.
+        self.slots = SlotStore(
+            directory=cfg.get("slot_dir", "/var/lib/radcam/slots"),
+            count=int(cfg.get("slot_count", DEFAULT_SLOTS)))
+
         self.stp = Experiment(
             link=self.stp_link, wire=wire, dispatcher=self.dispatcher,
             store=self.media, state_provider=lambda: self._stp_state,
-            events=self.stp_events, stream=self.stream,
+            events=self.stp_events, stream=self.stream, slots=self.slots,
             config=ExperimentConfig(
                 target_id=wire.target_id,
                 version=str(cfg.get("version", "1.0")),
@@ -302,6 +310,10 @@ class Daemon:
                  de_gpio)
         log.info("live stream configured (not started): %s",
                  self.stream.config.describe())
+        summary = self.slots.summary()
+        log.info("storage: %d slots, %d used, %d free",
+                 summary["slot_count"], summary["slots_used"],
+                 summary["slots_free"])
         if not self.stream.available:
             log.warning("live stream unavailable, missing: %s",
                         ", ".join(self.stream.missing()))

@@ -247,6 +247,21 @@ existing `radcam.protocol` format, dispatched unchanged. Every `struct` call in
 `radcam/stp/experiment.py` is little-endian; everywhere else in `radcam/stp/`
 is big-endian.
 
+### Storage slots
+
+Captures go into **numbered slots** (16 by default), not auto-incrementing
+media ids, so a canned hex command addresses the same place every pass.
+`SLOT_CAPTURE_IMAGE`, `SLOT_RECORD_START` (held on the Pi, not streamed),
+`SLOT_DOWNLOAD`, `SLOT_DELETE`. Deletion is what frees space. Each slot carries
+a CRC-32 checked on read; the index is TMR-protected.
+
+### Commands as hex strings
+
+`radcam/stp/catalogue.py` holds the command set as data; `tools/stp-command.py`
+renders pasteable 120-byte hex strings and `--verify` proves all 39 are
+accepted by a real decoder. Canned strings set the force flag, or a second
+paste would be suppressed as a retransmission.
+
 ### Channel roles
 
 | Channel | Carries | Never carries |
@@ -387,7 +402,7 @@ whichever module it is looking at.
 Stdlib `unittest` only — no pytest, no extra dependency on the flight Pi.
 
 ```bash
-python3 -m unittest discover -s tests -t .      # 176 tests, ~17 s
+python3 -m unittest discover -s tests -t .      # 217 tests, ~19 s
 ```
 
 | File | Covers |
@@ -399,6 +414,7 @@ python3 -m unittest discover -s tests -t .      # 176 tests, ~17 s
 | `tests/test_stp_experiment.py` | ACK/LRT/HRT state machine, dedup, safe mode, TMR |
 | `tests/test_stp_fec.py` | parity recovery, loss and resend |
 | `tests/test_stp_stream.py` | stream config clamping, frame parsing, drop-not-delay |
+| `tests/test_slots.py` | slot lifecycle, CRC checks, command hex strings |
 
 `tests/support.py` has `FakeEEPROM`, which subclasses `CameraEEPROM` at the raw
 read/write boundary so framing, CRC and repair are exercised as the real code,

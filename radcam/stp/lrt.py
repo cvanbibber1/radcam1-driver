@@ -164,6 +164,17 @@ OFF_STREAM_BYTES_SENT = 744
 OFF_STREAM_QUEUE_DEPTH = 752
 OFF_FEC_GROUP = 754
 
+# ---- storage slots --------------------------------------------------------
+# How full the payload is, and whether anything is being written right now.
+# The ground plans captures against this: a slot has to be downloaded and
+# deleted before it can be used again, so free-slot count is an operational
+# number, not a curiosity.
+OFF_SLOT_COUNT = 755
+OFF_SLOTS_USED = 756
+OFF_SLOT_RECORDING = 757          # 0xFF when nothing is recording
+OFF_SLOT_BYTES_USED = 758
+OFF_SLOT_DOWNLOADING = 766        # 0xFF when no slot transfer is queued
+
 #: Live stream states, reported in OFF_STREAM_STATE.
 STREAM_OFF, STREAM_STARTING, STREAM_RUNNING, STREAM_FAULT = 0, 1, 2, 3
 
@@ -173,11 +184,11 @@ STREAM_FLAG_GATED = 0x01
 STREAM_FLAG_ENCODER_LATE = 0x02
 
 # ---- event ring -----------------------------------------------------------
-OFF_EVENT_COUNT = 756
-OFF_EVENTS = OFF_EVENT_COUNT + 2                                 # 758
+OFF_EVENT_COUNT = 770
+OFF_EVENTS = OFF_EVENT_COUNT + 2                                 # 772
 EVENT_SIZE = 12
 OFF_PAYLOAD_CRC32 = 1244
-MAX_EVENTS = (OFF_PAYLOAD_CRC32 - OFF_EVENTS) // EVENT_SIZE      # 40
+MAX_EVENTS = (OFF_PAYLOAD_CRC32 - OFF_EVENTS) // EVENT_SIZE      # 39
 
 #: Transfer states reported in OFF_XFER_STATE.
 XFER_IDLE, XFER_ACTIVE, XFER_PAUSED, XFER_COMPLETE = 0, 1, 2, 3
@@ -389,6 +400,15 @@ def build_lrt_payload(state: dict, events: list[Event] | None = None) -> bytes:
                int(g("stream_queue_depth", 0)) & 0xFFFF)
     buf[OFF_FEC_GROUP] = int(g("fec_group_size", 0)) & 0xFF
 
+    buf[OFF_SLOT_COUNT] = int(g("slot_count", 0)) & 0xFF
+    buf[OFF_SLOTS_USED] = int(g("slots_used", 0)) & 0xFF
+    recording = int(g("slot_recording", -1))
+    buf[OFF_SLOT_RECORDING] = 0xFF if recording < 0 else recording & 0xFF
+    _pack_into(buf, OFF_SLOT_BYTES_USED, "Q",
+               int(g("slot_bytes_used", 0)) & (2**64 - 1))
+    downloading = int(g("slot_downloading", -1))
+    buf[OFF_SLOT_DOWNLOADING] = 0xFF if downloading < 0 else downloading & 0xFF
+
     events = events or []
     n = min(len(events), MAX_EVENTS)
     _pack_into(buf, OFF_EVENT_COUNT, "H", n)
@@ -502,6 +522,14 @@ def decode_lrt_payload(payload: bytes) -> dict:
         "stream_gated": bool(stream_flags & STREAM_FLAG_GATED),
         "stream_encoder_late": bool(stream_flags & STREAM_FLAG_ENCODER_LATE),
         "fec_group_size": payload[OFF_FEC_GROUP],
+        "slot_count": payload[OFF_SLOT_COUNT],
+        "slots_used": payload[OFF_SLOTS_USED],
+        "slots_free": max(0, payload[OFF_SLOT_COUNT] - payload[OFF_SLOTS_USED]),
+        "slot_recording": (-1 if payload[OFF_SLOT_RECORDING] == 0xFF
+                           else payload[OFF_SLOT_RECORDING]),
+        "slot_bytes_used": u("Q", OFF_SLOT_BYTES_USED),
+        "slot_downloading": (-1 if payload[OFF_SLOT_DOWNLOADING] == 0xFF
+                             else payload[OFF_SLOT_DOWNLOADING]),
     })
 
     for offset, key in ((OFF_RX_GOOD, "rx_good"),

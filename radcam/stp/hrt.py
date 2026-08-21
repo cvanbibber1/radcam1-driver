@@ -29,14 +29,13 @@ identify *which* chunks are bad and re-request exactly those through the
 command channel, rather than discovering at the end that the whole file's
 CRC-32 does not match and starting over.
 
-**Stop-with-loss.** The ICD names 0x86 "HRT Stop with loss" but does not define
-its behaviour, and the source explicitly says not to invent it. What is
-implemented here is deliberately minimal and reversible: it stops exactly like
-0x85, additionally rewinds the send pointer by `loss_rewind_chunks` (default 1)
-so the packet that was likely in flight is sent again, and records the event so
-the ground can see it happened. Re-sending a chunk the ground already has is
-harmless - it is idempotent at the reassembler. The authoritative recovery path
-remains an explicit RESEND command, which does not depend on this guess.
+**The two stops.** Both halt HRT immediately; they differ only in what happens
+to a packet already going out. **0x85 Stop** lets it finish, so the ground gets
+a whole valid final packet. **0x86 Stop with loss** cuts it short - the
+receiver sees a truncated frame, fails its CRC and discards it, which is what
+"with loss" names. A file chunk truncated that way is rewound by exactly one so
+it goes again; a video frame is dropped instead, because by the time the tap
+reopens it is stale.
 """
 
 from __future__ import annotations
@@ -357,23 +356,21 @@ class TransferManager:
 
     # -- flow control ----------------------------------------------------
 
-    def on_stop_with_loss(self) -> None:
-        """Rewind the send pointer so the in-flight chunk goes again.
+    def rewind_one(self) -> None:
+        """Send the last data chunk again, because it was truncated in flight.
 
-        See the module docstring: the ICD does not define this, so the action
-        is the smallest one that could help and cannot corrupt anything.
+        Called only when a transmission was actually cut short, so unlike a
+        guess about what the master might have lost, this knows exactly which
+        chunk did not arrive.
         """
         with self._lock:
-            self.loss_events += 1
             if not self._queue:
                 return
             transfer = self._queue[0]
-            before = transfer.chunk_next
-            transfer.chunk_next = max(0, transfer.chunk_next
-                                      - self.loss_rewind_chunks)
-            if transfer.chunk_next != before:
-                log.warning("HRT stop-with-loss: media %d rewound %d -> %d",
-                            transfer.media_id, before, transfer.chunk_next)
+            if transfer.chunk_next > 0:
+                transfer.chunk_next -= 1
+                log.info("media %d: chunk %d truncated, will resend",
+                         transfer.media_id, transfer.chunk_next)
 
     # -- emission --------------------------------------------------------
 

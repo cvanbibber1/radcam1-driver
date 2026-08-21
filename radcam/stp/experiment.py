@@ -75,13 +75,26 @@ __all__ = ["Experiment", "ExperimentConfig", "StpOp"]
 
 
 class StpOp:
-    """Link-level opcodes handled here rather than by the media dispatcher.
+    """Link- and payload-level opcodes handled here.
 
-    These exist so the link itself can be managed from the ground without a
-    reboot: an experiment that can only be recovered by power-cycling is not
-    autonomous. They occupy the command opcode space above the media commands.
+    They live in 0x64-0x7B, a range the legacy `radcam.protocol.Msg` set never
+    uses, so a command opcode is unambiguous whichever generation of the
+    protocol a ground station was written against.
     """
 
+    # -- storage slots ---------------------------------------------------
+    # Fixed addresses, so a canned command means the same thing every time.
+    SLOT_LIST = 0x64
+    SLOT_INFO = 0x65
+    SLOT_CAPTURE_IMAGE = 0x66
+    SLOT_RECORD_START = 0x67
+    SLOT_RECORD_STOP = 0x68
+    SLOT_DOWNLOAD = 0x69
+    SLOT_DELETE = 0x6A
+    SLOT_DELETE_ALL = 0x6B
+    SLOT_DOWNLOAD_ABORT = 0x6C
+
+    # -- link management -------------------------------------------------
     CLEAR_SAFE_MODE = 0x70
     ABORT_TRANSFERS = 0x71
     GET_LINK_STATS = 0x72
@@ -137,7 +150,7 @@ class Experiment:
     def __init__(self, link, wire: Wire = DEFAULT_WIRE,
                  dispatcher=None, store=None, state_provider=None,
                  config: ExperimentConfig | None = None,
-                 events: L.EventLog | None = None, stream=None):
+                 events: L.EventLog | None = None, stream=None, slots=None):
         self.link = link
         self.wire = wire
         self.dispatcher = dispatcher
@@ -150,12 +163,12 @@ class Experiment:
         self.events = events or L.EventLog()
 
         self.reader = PacketReader(wire)
-        self.transfers = TransferManager(
-            reload=(store.read if store is not None else None),
-            group_size=self.cfg.fec_group_size)
+        self.transfers = TransferManager(reload=self._resolve_media,
+                                         group_size=self.cfg.fec_group_size)
         #: Live video. Constructed lazily on STREAM_START so that a payload
         #: which never streams pays nothing for the capability.
         self.stream = stream
+        self.slots = slots
         self._stream_frame: bytes | None = None
         self._stream_chunk = 0
         self._stream_chunks = 0
@@ -188,6 +201,11 @@ class Experiment:
         # -- plain state --------------------------------------------------
         self.started = time.monotonic()
         self.hrt_last_control = 0
+        #: Set by a stop-with-loss, consumed by the in-flight abort check.
+        self._abort_hrt = False
+        #: Packets read while a transmission was draining. They are real
+        #: traffic and must be acted on once the wire is ours to leave.
+        self._deferred: list = []
         self.coarse_time = 0
         self.fine_time = 0
         self.consecutive_failures = 0
@@ -206,6 +224,193 @@ class Experiment:
         self._queue: queue.Queue = queue.Queue(maxsize=self.cfg.max_command_queue)
         self._worker: threading.Thread | None = None
         self._running = threading.Event()
+
+    def _resolve_media(self, media_id: int) -> bytes | None:
+        """Bytes behind a transfer id: a storage slot, or legacy media."""
+        if self.slots is not None:
+            data = self.slots.read_by_media_id(media_id)
+            if data is not None:
+                return data
+        if self.store is None:
+            return None
+        try:
+            return self.store.read(media_id)
+        except Exception as exc:                       # noqa: BLE001
+            log.error("reading media %d failed: %s", media_id, exc)
+            return None
+
+    # -- storage slots ----------------------------------------------------
+
+    @property
+    def _camera(self):
+        return getattr(self.dispatcher, "camera", None)
+
+    def _slot_command(self, request) -> None:
+        if self.slots is None:
+            return self._fail(request, Err.NO_MEDIA)
+        opcode = request.opcode
+        args = request.args
+
+        if opcode == StpOp.SLOT_LIST:
+            return self._succeed(request, self.slots.pack_table())
+
+        if opcode == StpOp.SLOT_DELETE_ALL:
+            freed = self.slots.delete_all()
+            self.events.add(L.EventCode.TRANSFER_ABORTED, arg=freed)
+            return self._succeed(request, struct.pack("<H", freed))
+
+        if opcode == StpOp.SLOT_RECORD_STOP:
+            return self._slot_record_stop(request)
+
+        # Everything remaining addresses one slot.
+        if not args:
+            return self._fail(request, Err.BAD_PARAM)
+        index = args[0]
+        if not self.slots.valid(index):
+            return self._fail(request, Err.BAD_PARAM)
+
+        if opcode == StpOp.SLOT_INFO:
+            return self._succeed(request, self.slots.pack_one(index))
+
+        if opcode == StpOp.SLOT_DELETE:
+            self.transfers.abort(self.slots.get(index).media_id)
+            if not self.slots.delete(index):
+                return self._fail(request, Err.NO_MEDIA)
+            return self._succeed(request, bytes([index]))
+
+        if opcode == StpOp.SLOT_DOWNLOAD_ABORT:
+            aborted = self.transfers.abort(self.slots.get(index).media_id)
+            return self._succeed(request, bytes([1 if aborted else 0]))
+
+        if opcode == StpOp.SLOT_DOWNLOAD:
+            return self._slot_download(request, index)
+
+        if opcode == StpOp.SLOT_CAPTURE_IMAGE:
+            return self._slot_capture(request, index)
+
+        if opcode == StpOp.SLOT_RECORD_START:
+            limit = struct.unpack("<H", args[1:3])[0] if len(args) >= 3 else 0
+            return self._slot_record_start(request, index, limit)
+
+        return self._fail(request, Err.BAD_TYPE)
+
+    def _slot_download(self, request, index: int) -> None:
+        slot = self.slots.get(index)
+        if slot is None or not slot.occupied:
+            return self._fail(request, Err.NO_MEDIA)
+        data = self.slots.read(index)
+        if data is None:
+            # read() returns None when the stored CRC-32 no longer matches, so
+            # this is "the file rotted", not "no such file".
+            return self._fail(request, Err.EEPROM_FAULT)
+
+        if not self.transfers.enqueue(slot.media_id, data,
+                                      kind=0 if slot.kind == 1 else 1,
+                                      width=slot.width, height=slot.height,
+                                      created_unix=slot.created_unix):
+            return self._fail(request, Err.BUSY)
+
+        self.events.add(L.EventCode.TRANSFER_STARTED, arg=index)
+        chunks = (len(data) + HRT_CHUNK_DATA - 1) // HRT_CHUNK_DATA
+        return self._succeed(request, struct.pack(
+            "<BIII", index, slot.media_id, len(data), chunks))
+
+    def _slot_capture(self, request, index: int) -> None:
+        camera = self._camera
+        if camera is None or not camera.available():
+            return self._fail(request, Err.CAMERA_FAULT)
+        if self.slots.recording_slot is not None:
+            return self._fail(request, Err.BUSY)
+
+        try:
+            record = camera.capture_image(self.config)
+            data = self.store.read(record.media_id) if self.store else None
+        except Exception as exc:                       # noqa: BLE001
+            log.error("capture into slot %d failed: %s", index, exc)
+            self.events.add(L.EventCode.CAPTURE_FAILED, arg=index,
+                            severity=L.SEV_ERROR)
+            return self._fail(request, Err.CAMERA_FAULT)
+
+        if not data:
+            return self._fail(request, Err.CAMERA_FAULT)
+
+        slot = self.slots.store(index, data, 1, record.width, record.height)
+        # The capture lives in the slot now; leaving a second copy in the
+        # media store would fill the disk one capture at a time.
+        if self.store is not None:
+            self.store.delete(record.media_id)
+        if slot is None:
+            return self._fail(request, Err.STORAGE_FULL)
+
+        self.events.add(L.EventCode.CAPTURE_OK, arg=index)
+        return self._succeed(request, struct.pack(
+            "<BIHHI", index, slot.size, slot.width, slot.height, slot.crc32))
+
+    def _slot_record_start(self, request, index: int, limit_s: int) -> None:
+        camera = self._camera
+        if camera is None or not camera.available():
+            return self._fail(request, Err.CAMERA_FAULT)
+        if self.slots.recording_slot is not None:
+            return self._fail(request, Err.BUSY)
+
+        try:
+            camera.start_record(self.config)
+        except Exception as exc:                       # noqa: BLE001
+            log.error("record into slot %d failed to start: %s", index, exc)
+            return self._fail(request, Err.CAMERA_FAULT)
+
+        self.slots.mark_recording(index, float(limit_s))
+        self.events.add(L.EventCode.RECORD_STARTED, arg=index)
+        log.info("recording into slot %d%s", index,
+                 f", limit {limit_s}s" if limit_s else "")
+        return self._succeed(request, struct.pack("<BH", index, limit_s))
+
+    def _slot_record_stop(self, request=None):
+        """Finish a recording into its slot. Also called by the duration timer."""
+        index = self.slots.recording_slot
+        if index is None:
+            return self._fail(request, Err.BAD_PARAM) if request else None
+
+        camera = self._camera
+        data, record = None, None
+        try:
+            record = camera.stop_record() if camera is not None else None
+            if record is not None and self.store is not None:
+                data = self.store.read(record.media_id)
+        except Exception as exc:                       # noqa: BLE001
+            log.error("stopping the recording failed: %s", exc)
+
+        self.slots.clear_recording()
+        if not data:
+            self.slots.delete(index)
+            self.events.add(L.EventCode.CAPTURE_FAILED, arg=index,
+                            severity=L.SEV_ERROR)
+            return self._fail(request, Err.CAMERA_FAULT) if request else None
+
+        slot = self.slots.store(index, data, 2, record.width, record.height,
+                                duration_s=getattr(record, "duration_s", 0.0))
+        if self.store is not None:
+            self.store.delete(record.media_id)
+        self.events.add(L.EventCode.RECORD_STOPPED, arg=index)
+        if request is None:
+            return None
+        return self._succeed(request, struct.pack(
+            "<BIf", index, slot.size if slot else 0,
+            slot.duration_s if slot else 0.0))
+
+    def tick(self) -> None:
+        """Time-driven housekeeping, called once per service pass.
+
+        A recording with a duration has to end by itself: the whole point of
+        giving one a limit is that the ground does not have to be in contact
+        to stop it.
+        """
+        if self.slots is not None and self.slots.recording_expired():
+            log.info("recording reached its time limit")
+            try:
+                self._slot_record_stop(None)
+            except Exception as exc:                   # noqa: BLE001
+                log.error("auto-stopping the recording failed: %s", exc)
 
     # ------------------------------------------------------------ lifecycle
 
@@ -251,12 +456,21 @@ class Experiment:
                 data = self.link.read_wait(self.poll_timeout_s)
             else:
                 data = self.link.read()
-            for packet in self.reader.feed(data):
+
+            packets = self.reader.feed(data)
+            if self._deferred:
+                # Anything picked up mid-transmission goes first: it arrived
+                # first, and one of them may be the stop that ended it.
+                packets = self._deferred + packets
+                self._deferred = []
+
+            for packet in packets:
                 try:
                     self._on_packet(packet)
                     handled += 1
                 except Exception as exc:               # noqa: BLE001
                     log.exception("handling packet failed: %s", exc)
+            self.tick()
             self._pump_hrt()
         except Exception as exc:                       # noqa: BLE001
             log.exception("service pass failed: %s", exc)
@@ -390,6 +604,9 @@ class Experiment:
             self.transfers.group_size = group
             log.info("FEC parity group size set to %d", group)
             return self._succeed(request, bytes([group]))
+
+        if StpOp.SLOT_LIST <= opcode <= StpOp.SLOT_DOWNLOAD_ABORT:
+            return self._slot_command(request)
 
         if opcode in (StpOp.STREAM_START, StpOp.STREAM_STOP,
                       StpOp.STREAM_SET_REGION, StpOp.STREAM_SET_OUTPUT):
@@ -737,6 +954,15 @@ class Experiment:
         })
         state.update(self.transfers.status())
         state["fec_group_size"] = self.cfg.fec_group_size
+        if self.slots is not None:
+            state.update(self.slots.summary())
+            # Report the transfer in progress as a slot number when it is one,
+            # so the ground does not have to decode the synthetic media id.
+            from ..slots import SLOT_MEDIA_BASE
+            active = state.get("xfer_media_id", 0)
+            state["slot_downloading"] = (
+                active & 0xFF if (active & 0xFFFFFF00) == SLOT_MEDIA_BASE
+                else -1)
         state.update(self._stream_state())
         if self._safe_mode.value():
             state["xfer_state"] = L.XFER_PAUSED
@@ -747,6 +973,20 @@ class Experiment:
     # ------------------------------------------------------------------ HRT
 
     def _on_hrt_control(self, ptype: int) -> None:
+        """Open or close the HRT tap.
+
+        The two stops differ only in what happens to a packet already going
+        out:
+
+        * **0x85 Stop** lets the packet in flight finish, then sends no more.
+          The ground gets a whole, valid final packet.
+        * **0x86 Stop with loss** cuts the transmission short. The receiver
+          sees a truncated frame, fails its CRC and discards it - which is what
+          "with loss" names. The chunk it carried is rewound so it goes again
+          when the tap reopens.
+
+        Neither buffers anything: both stop HRT the moment they are seen.
+        """
         self.hrt_last_control = ptype
 
         if ptype == PacketType.HRT_GO:
@@ -754,13 +994,18 @@ class Experiment:
                 log.warning("HRT Go refused: safe mode")
                 return
             self._hrt_enabled.store(True)
+            # Clear any abort left over from the last stop, or the first packet
+            # of this window would be truncated for no reason.
+            self._abort_hrt = False
             self.events.add(L.EventCode.HRT_GO)
             log.info("HRT enabled by DICE")
             return
 
         self._hrt_enabled.store(False)
         if ptype == PacketType.HRT_STOP_WITH_LOSS:
-            self.transfers.on_stop_with_loss()
+            # Consumed by the abort check armed around every HRT transmission.
+            self._abort_hrt = True
+            self.transfers.loss_events += 1
             self.events.add(L.EventCode.HRT_STOP_WITH_LOSS,
                             severity=L.SEV_WARN)
         else:
@@ -783,6 +1028,7 @@ class Experiment:
             # When no frame is ready the encoder is between frames, and that
             # gap is exactly when a file chunk should use the link.
             payload = self._next_stream_payload()
+            from_stream = payload is not None
             if payload is None:
                 payload = self.transfers.next_payload()
             if payload is None:
@@ -790,9 +1036,25 @@ class Experiment:
                     payload = b"\x00" * 1280
                 else:
                     return
-            if not self._transmit(encode_hrt_data(payload, self.wire,
-                                                  self.cfg.target_id)):
+            sent = self._transmit(
+                encode_hrt_data(payload, self.wire, self.cfg.target_id),
+                abortable=True)
+
+            if not sent:
+                if self._abort_hrt:
+                    self._abort_hrt = False
+                    # The packet was truncated, so whatever it carried did not
+                    # arrive. A file chunk is worth sending again; a video
+                    # frame is not - by the time the tap reopens it is stale,
+                    # which is the whole reason a stream drops rather than
+                    # queues.
+                    if from_stream:
+                        self._drop_stream_frame()
+                    else:
+                        self.transfers.rewind_one()
+                    log.info("HRT transmission aborted by stop-with-loss")
                 return
+
             self._hrt_sent.add(1)
             # DICE can revoke the tap between packets; re-check every time
             # rather than committing to a whole burst.
@@ -801,12 +1063,48 @@ class Experiment:
 
     # ------------------------------------------------------------ transmit
 
-    def _transmit(self, packet: bytes) -> bool:
+    def _transmit(self, packet: bytes, abortable: bool = False) -> bool:
+        """Send one packet. Only HRT is abortable.
+
+        A Command ACK or an LRT reply is a direct answer to something DICE
+        asked for, and truncating one would leave the master with no reply at
+        all. Only bulk HRT traffic is interruptible.
+        """
         try:
-            ok = self.link.send(packet)
+            ok = self.link.send(
+                packet, abort_check=self._abort_check if abortable else None)
         except Exception as exc:                       # noqa: BLE001
             log.error("transmit failed: %s", exc)
             ok = False
-        if not ok:
+        if not ok and not self._abort_hrt:
+            # An abort is a commanded outcome, not a transmit failure.
             self.events.add(L.EventCode.TX_FAILED, severity=L.SEV_ERROR)
         return ok
+
+    def _abort_check(self) -> bool:
+        """Polled while an HRT packet drains: has a stop-with-loss arrived?
+
+        Everything read here is parsed properly and deferred rather than
+        discarded, so a command that happens to land mid-transmission is not
+        lost just because it shared the wire with our own bytes.
+        """
+        if self._abort_hrt:
+            return True
+        try:
+            data = self.link.read()
+        except Exception:                              # noqa: BLE001
+            return False
+        if not data:
+            return False
+
+        abort = False
+        for packet in self.reader.feed(data):
+            if getattr(packet, "packet_type", None) == \
+                    PacketType.HRT_STOP_WITH_LOSS:
+                # Record it here as well as returning True: the pump has to
+                # distinguish a commanded abort from a transmit failure, and
+                # the packet itself is not processed until the next pass.
+                self._abort_hrt = True
+                abort = True
+            self._deferred.append(packet)
+        return abort

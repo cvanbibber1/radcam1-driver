@@ -65,7 +65,13 @@ class MemoryBus:
             time.sleep(min(timeout_s, 0.001))
         return self.read(size)
 
-    def send(self, data: bytes) -> bool:
+    def send(self, data: bytes, abort_check=None) -> bool:
+        if abort_check is not None:
+            try:
+                if abort_check():
+                    return False
+            except Exception:                          # noqa: BLE001
+                pass
         self.to_dice += data
         self.tx_packets += 1
         return True

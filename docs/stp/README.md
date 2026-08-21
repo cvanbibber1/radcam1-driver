@@ -25,6 +25,8 @@ assumed.
 | `radcam/stp/hrt.py` | the 1280-byte bulk payload and transfer manager — **ours to define** |
 | `radcam/stp/fec.py` | XOR parity groups: correcting a lost chunk, not just detecting it |
 | `radcam/stream.py` | live H.264 over HRT: encoder pipeline, region of interest, drop-not-delay |
+| `radcam/slots.py` | numbered storage slots, so a canned command has a fixed address |
+| `radcam/stp/catalogue.py` | the command set as data, so hex strings and docs cannot drift |
 | `radcam/stp/redundancy.py` | TMR for state in RAM, plus a scrubber |
 | `radcam/stp/timebase.py` | GPS-epoch coarse/fine time |
 
@@ -113,8 +115,9 @@ live in `Wire` and `/etc/radcam/config.json` under `"stp"`.
 | LRT trailing 2 bytes | `lrt_trailer` | `crc` | **mission-confirmed** (was an inference) |
 | Baud | `baud` | 921600 | **mission-confirmed** |
 | DE pin | `de_gpio` | GPIO4, active high | **mission-confirmed** |
-| Initial HRT state | — | disabled | **assumed**, conservative |
-| Stop-with-loss | — | rewind 1 chunk | **assumed**, see below |
+| Initial HRT state | — | disabled | **mission-confirmed** |
+| Stop 0x85 | — | finish the packet in flight | **mission-confirmed** |
+| Stop-with-loss 0x86 | — | truncate the packet in flight | **mission-confirmed** |
 
 Raw `coarse_time` and `fine_time` are stored verbatim in LRT, so if the epoch
 or leap offset is wrong, every past record is still re-derivable.
@@ -125,14 +128,65 @@ both byte orders × three coverage ranges and prints the config change needed.
 Verified by construction: given packets built with CRC-16/X-25 little-endian,
 it recovers exactly that from four samples.
 
-### Stop-with-loss (0x86)
+### The two stops
 
-The ICD names it but does not define it, and says not to invent it. What is
-implemented is the smallest thing that could help and cannot corrupt anything:
-stop as for 0x85, rewind the send pointer by one chunk so the packet likely in
-flight goes again, and log the event. Re-sending a chunk the ground already has
-is idempotent at the reassembler. **The authoritative recovery path is an
-explicit RESEND command**, which does not depend on this guess.
+Both halt HRT the moment they are seen; they differ only in what happens to a
+packet already going out.
+
+**0x85 Stop** lets it finish, so the ground gets a whole, valid final packet.
+
+**0x86 Stop with loss** cuts it short. `Rs422Link.abort_tx()` discards what is
+still queued in the kernel and drops DE, so the receiver sees a truncated frame,
+fails its CRC and discards it — which is exactly what "with loss" names. Up to
+a FIFO's worth of bytes, about 32 or 350 µs, may already be past recall; the
+guarantee is that the packet does not *finish*, not that it stops on a given
+bit.
+
+Detecting the stop mid-transmission needs the transceiver's receiver live while
+we transmit. The ADM2582E is full duplex, with separate driver and receiver
+pairs, so with /RE tied active this works: `send()` polls an abort check every
+millisecond while the packet drains. If /RE is instead tied to DE the payload is
+deaf while transmitting, the check never fires, and the abort takes effect at
+the next packet boundary. That is a wiring question, not a software one.
+
+After an abort, a truncated **file** chunk is rewound by exactly one so it goes
+again — unlike a guess about what the master might have lost, this knows which
+chunk did not arrive. A truncated **video** frame is dropped instead: by the
+time the tap reopens it is stale, which is the same reason the stream ring
+discards rather than queues.
+
+## Storage slots
+
+Captures address **numbered slots**, not auto-incrementing media ids. The
+reason is the ground station: it pastes fixed hex strings, so "download the
+image I just took" can only exist as a command if the address is fixed in
+advance. Slot 3 is slot 3 whatever happened before.
+
+Deletion is explicit and is what frees space, so storage is managed by the
+ground rather than filling silently. The slot index is stored triple-redundantly
+through `radcam.tmr` — it is the one piece of state that makes the stored bytes
+findable, and losing it would leave files on disk that nothing can name. The
+payload bytes are not triplicated: far too large, and a corrupted image is
+recoverable by taking another.
+
+Each slot carries a CRC-32 written with it and checked on read, so a file that
+rotted is reported as a fault rather than discovered after minutes of downlink.
+A recording interrupted by power loss leaves its slot free, not half-occupied.
+
+Slot transfers use media ids `0x510000NN`, a namespace that cannot collide with
+a legacy media id on the wire.
+
+## Commands as hex strings
+
+The ground pastes complete 120-byte packets as hex. That makes the command set
+a table rather than prose, so `radcam/stp/catalogue.py` holds it as data and
+both `tools/stp-command.py` and the user guide's reference render from it — a
+command cannot be documented wrongly if the documentation is generated from the
+thing that builds it. `--verify` feeds every generated string to a real decoder
+and confirms it is accepted and dispatched to the opcode it claims.
+
+Canned strings carry the **force flag**, because the sequence number is baked in
+and would otherwise be suppressed as a retransmission on the second paste.
 
 ## The parts we defined
 
@@ -355,12 +409,10 @@ only hands it over, and **never does I/O while DICE is waiting**.
 
 ## Still open
 
-1. **Stop-with-loss semantics are a guess.** The ICD names 0x86 but does not
-   define it, and says not to invent it. Implemented as stop plus a one-chunk
-   rewind; explicit RESEND remains the authoritative recovery path and does not
-   depend on the guess.
-2. **Initial HRT state is assumed disabled.** Conservative, and the ICD does
-   not state it.
-3. **No wire test against real DICE.** Verified in-process, through PTY pairs,
-   and on the real UART for DE timing and live video — but the flight computer
-   has not been in the loop.
+1. **No wire test against real DICE.** Verified in-process, through PTY pairs,
+   and on the real UART for DE timing, throughput and live video — but the
+   flight computer has not been in the loop.
+
+Everything else the ICD left undefined has now been settled by the mission:
+byte order, CRC variant and position, target ID, epoch, baud, DE pin, the two
+stop semantics, and the initial HRT state.
