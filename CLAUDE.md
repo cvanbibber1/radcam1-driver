@@ -191,7 +191,7 @@ Config: `/etc/radcam/config.json`. Calibration: `/var/lib/radcam/dosimeter-cal.j
 |---|---|---|
 | Dosimeter LTC2485 | GPIO2/3, `i2c-1`, **addr 0x24** | ✅ working (CA0/CA1 both floating) |
 | LED PWM | GPIO18 → PWM0_CHAN2, `pwmchip0` ch 2 | ✅ working, capped at 10% |
-| Flight RS422 | GPIO14/15 → uart0 → `/dev/ttyAMA0` | ✅ working, **STP/DICE at 921600** |
+| Flight RS422 | GPIO14/15 → uart0 → `/dev/ttyAMA0` | ✅ **STP/DICE at 921600, target 0xC7** |
 | RS422 driver enable | GPIO4 → ADM2582E DE | ✅ working, released ~30 µs after last stop bit |
 | EXTUART mirror | GPIO24 TX / GPIO23 RX, **RP1 PIO** | ✅ working at **921600**, bidirectional |
 
@@ -240,31 +240,46 @@ Three consequences shape the whole design:
 
 ### Byte order — the trap
 
-**ICD structures are big-endian** (envelope, command header, LRT, HRT).
+**ICD structures are big-endian** (envelope, command header, LRT, HRT), and the
+CRC is always the **final two bytes of every message**.
 **Command args and response blobs are little-endian**, because they are the
 existing `radcam.protocol` format, dispatched unchanged. Every `struct` call in
 `radcam/stp/experiment.py` is little-endian; everywhere else in `radcam/stp/`
 is big-endian.
 
-### Two downlink paths
+### Channel roles
 
-| Path | Per packet | Rate | Needs |
-|---|---:|---|---|
-| HRT | 1256 B | **89 kB/s measured** | `HRT Go` from DICE |
-| LRT file block | 512 B | ~5 kB/s at 10 polls/s | nothing |
+| Channel | Carries | Never carries |
+|---|---|---|
+| **LRT** | telemetry and vitals only | bulk data of any kind |
+| **HRT** | live video, and chunked file transfer | housekeeping |
 
-HRT is ~18x faster and is the normal choice. LRT exists because HRT needs
-permission the payload cannot grant itself: if the master never opens the tap,
-the LRT file block is the only way an image comes home.
+### Live video
+
+H.264 over HRT, **640x480 at 15 fps and 600 kbit/s by default**, with the crop
+box centred on any sensor pixel — crop equal to output gives 1:1 native pixels.
+Measured end to end: 15.0 fps, 584 kbit/s, keyframe per second, zero chunk CRC
+failures, decodes with no errors.
+
+`rpicam-vid --codec h264` **does not work on a Pi 5** — no hardware encoder, no
+`/dev/video11`, and rpicam-apps built without libav. The pipeline is
+`rpicam-vid --codec yuv420 | ffmpeg -c:v libx264`, run with
+`sliced-threads=0:threads=1`.
+
+**A stream drops, it never queues.** Bounded ring, oldest discarded, flushed
+when HRT closes — buffering would turn a bandwidth shortfall into unbounded
+latency. Live video preempts file transfer; file chunks use the gaps between
+frames.
 
 ### Error correction
 
-Both paths carry per-chunk CRC-32 (detection) **and** XOR parity every
-`fec_group_size` chunks (correction). A single lost chunk per group is rebuilt
-by the ground with no retransmission, at 6.25% overhead at the default group of
-16. Parity is emitted as each group closes, so an interrupted transfer still
-leaves completed groups repairable. Beyond one loss per group, explicit RESEND
-takes over. `SET_FEC_GROUP` (0x77) tunes or disables it.
+HRT **file transfer** carries per-chunk CRC-32 (detection) plus XOR parity
+every `fec_group_size` chunks (correction): one lost chunk per group is rebuilt
+with no retransmission, at 6.25% overhead at the default of 16. Parity is
+emitted as each group closes, so an interrupted transfer still leaves completed
+groups repairable. Beyond one loss per group, explicit RESEND takes over.
+Live video carries no parity — a late frame is worthless, and H.264 recovers at
+the next keyframe for free.
 
 ### DE timing — measured, not assumed
 
@@ -275,7 +290,7 @@ and releases within **~30 µs at any packet size**, sustaining 89 kB/s of HRT
 payload at 99.7% wire utilisation. Re-verify with `tools/stp-de-timing.py`.
 
 ```bash
-tools/stp-verify.py            # 81 reliability / safety / autonomy checks
+tools/stp-verify.py            # 85 reliability / safety / autonomy checks
 tools/stp-sim.py --self-test   # 21-check protocol conversation, no hardware
 tools/stp-de-timing.py --throughput
 tools/stp-crc-solve.py --bin capture.bin   # recover the real CRC parameters
@@ -372,7 +387,7 @@ whichever module it is looking at.
 Stdlib `unittest` only — no pytest, no extra dependency on the flight Pi.
 
 ```bash
-python3 -m unittest discover -s tests -t .      # 158 tests, ~17 s
+python3 -m unittest discover -s tests -t .      # 176 tests, ~17 s
 ```
 
 | File | Covers |
@@ -382,7 +397,8 @@ python3 -m unittest discover -s tests -t .      # 158 tests, ~17 s
 | `tests/test_protocol.py` | region capture bounds, EEPROM commands, write protection, clamping |
 | `tests/test_stp_packets.py` | ICD packet sizes/offsets, CRC coverage, resync on a shared bus |
 | `tests/test_stp_experiment.py` | ACK/LRT/HRT state machine, dedup, safe mode, TMR |
-| `tests/test_stp_fec.py` | parity recovery, LRT file transfer, loss and resend |
+| `tests/test_stp_fec.py` | parity recovery, loss and resend |
+| `tests/test_stp_stream.py` | stream config clamping, frame parsing, drop-not-delay |
 
 `tests/support.py` has `FakeEEPROM`, which subclasses `CameraEEPROM` at the raw
 read/write boundary so framing, CRC and repair are exercised as the real code,

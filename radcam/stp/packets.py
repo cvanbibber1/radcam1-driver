@@ -132,17 +132,28 @@ class Wire:
     put each word out low byte first, giving `CF 1A 1D FC`. Both are generated
     from the same word constants rather than being hard-coded byte strings, so
     flipping this flag cannot leave the sync and the integers disagreeing.
+
+    **Big-endian is confirmed by the mission**, as is CRC-16/CCITT-FALSE, and
+    that the last two bytes of *every* message are the CRC. The flags remain
+    because a settable parameter costs nothing and an assumption baked into
+    thirty call sites costs a rewrite.
     """
 
     big_endian: bool = True
     crc: Crc16Params = field(default_factory=lambda: CCITT_FALSE)
-    target_id: int = 0x01
+    #: This experiment's assigned address on the DICE bus. Mission-assigned,
+    #: not a placeholder: packets carrying any other Target_ID are dropped by
+    #: the receiver before any application code sees them.
+    target_id: int = 0xC7
     #: First byte the CRC covers. The ICD states 4 (just past sync) for the HRT
     #: classes and does not confirm it for the others.
     crc_start: int = 4
-    #: What occupies the final two bytes of an LRT Data packet. The ICD's
-    #: visible rows account for only 1254 of the stated 1256 bytes; a trailing
-    #: CRC is the reading consistent with HRT, but it is an inference.
+    #: What occupies the final two bytes of an LRT Data packet. The supplied
+    #: ICD excerpt accounted for only 1254 of the stated 1256 bytes, leaving
+    #: this an inference; the mission has since **confirmed that the last two
+    #: bytes of every message are the CRC**, so "crc" is the correct and only
+    #: expected setting. "zero" is retained purely for interoperability
+    #: testing against a non-conforming peer.
     lrt_trailer: str = "crc"          # "crc" or "zero"
 
     # -- helpers ---------------------------------------------------------

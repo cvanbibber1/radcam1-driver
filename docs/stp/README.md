@@ -23,8 +23,8 @@ assumed.
 | `radcam/stp/commands.py` | the 105-byte command payload — **ours to define** |
 | `radcam/stp/lrt.py` | the 1248-byte housekeeping payload — **ours to define** |
 | `radcam/stp/hrt.py` | the 1280-byte bulk payload and transfer manager — **ours to define** |
-| `radcam/stp/lrtfile.py` | file transfer over LRT polls — the downlink that is never blocked |
 | `radcam/stp/fec.py` | XOR parity groups: correcting a lost chunk, not just detecting it |
+| `radcam/stream.py` | live H.264 over HRT: encoder pipeline, region of interest, drop-not-delay |
 | `radcam/stp/redundancy.py` | TMR for state in RAM, plus a scrubber |
 | `radcam/stp/timebase.py` | GPS-epoch coarse/fine time |
 
@@ -34,8 +34,8 @@ assumed.
 | `tools/stp-de-timing.py --throughput` | measures DE assertion against wire time |
 | `tools/stp-crc-solve.py --bin capture.bin` | recovers the real CRC parameters from traffic |
 
-Tests: `tests/test_stp_packets.py` (24), `tests/test_stp_experiment.py` (50)
-and `tests/test_stp_fec.py` (33).
+Tests: `tests/test_stp_packets.py` (26), `tests/test_stp_experiment.py` (50),
+`tests/test_stp_fec.py` (13) and `tests/test_stp_stream.py` (36).
 
 ## The three decisions that shape everything
 
@@ -103,18 +103,18 @@ live in `Wire` and `/etc/radcam/config.json` under `"stp"`.
 
 | Item | Setting | Value | Confidence |
 |---|---|---|---|
-| Endianness | `big_endian` | `true` | Sync `1A CF FC 1D`; **assumed**, unverified |
+| Endianness | `big_endian` | `true` | **mission-confirmed**; verified on the wire as `1A CF FC 1D` |
 | CRC-16 variant | `crc_variant` | `CRC-16/CCITT-FALSE` | **mission-confirmed** |
-| CRC coverage | `crc_start` | `4` | ICD-stated for HRT, **assumed** for the rest |
-| CRC byte order | (in variant) | big-endian | **assumed** |
-| Target ID | `target_id` | `1` | **needs assignment** |
+| CRC position | — | final two bytes of **every** message | **mission-confirmed** |
+| CRC coverage | `crc_start` | `4` | ICD-stated for HRT, consistent for the rest |
+| Target ID | `target_id` | **`0xC7`** | **mission-assigned** |
 | Coarse-time epoch | — | GPS, 1980-01-06 | **mission-confirmed** |
 | Leap offset | — | 18 s | current; a mission-time leap second needs updating |
-| LRT trailing 2 bytes | `lrt_trailer` | `crc` | **inferred**, consistent with HRT |
-| Initial HRT state | — | disabled | **assumed**, conservative |
-| Stop-with-loss | — | rewind 1 chunk | **assumed**, see below |
+| LRT trailing 2 bytes | `lrt_trailer` | `crc` | **mission-confirmed** (was an inference) |
 | Baud | `baud` | 921600 | **mission-confirmed** |
 | DE pin | `de_gpio` | GPIO4, active high | **mission-confirmed** |
+| Initial HRT state | — | disabled | **assumed**, conservative |
+| Stop-with-loss | — | rewind 1 chunk | **assumed**, see below |
 
 Raw `coarse_time` and `fine_time` are stored verbatim in LRT, so if the epoch
 or leap offset is wrong, every past record is still re-derivable.
@@ -214,32 +214,88 @@ the ground knows what was corrupted. So completed transfers are retained (last
 store again. Without both, resend worked only in the case where it was least
 needed.
 
-## Two downlink paths, and why both exist
+## What each channel is for
 
-HRT is the fast one. It is also the one that needs permission: it flows only
-between an `HRT Go` and a `Stop`, and that decision belongs to DICE. A payload
-with an HRT-only downlink cannot return an image if the master never opens the
-tap — because HRT is allocated to another experiment that pass, or the schedule
-simply does not permit it.
+| Channel | Carries | Never carries |
+|---|---|---|
+| **LRT** | telemetry and vitals: dose, temperature, storage, link health, last-command result, event ring | bulk data of any kind |
+| **HRT** | live video, and chunked file transfer of stored media | housekeeping |
 
-So a file can also be pulled through the **LRT file block**, one chunk per poll,
-on the channel that is always polled:
+An earlier revision reserved 544 bytes of the LRT payload for a contingency
+file-transfer path. That is gone: with HRT confirmed as the transfer channel,
+the space is better spent on what LRT is actually for. Removing it doubled the
+command-response window back to 512 bytes and took the event ring from 19
+entries to 40.
 
-| Path | Per packet | Rate | Needs |
-|---|---:|---|---|
-| HRT | 1256 B | **89.2 kB/s measured** | `HRT Go` from DICE |
-| LRT | 512 B | 512 B × poll rate (~5 kB/s at 10 Hz) | nothing |
+## Live video
 
-A 3 MB image is 35 seconds over HRT and about ten minutes over LRT. That makes
-LRT a poor way to move a large image and a perfectly good way to move a
-thumbnail, a dose log, a calibration record, or an image that would otherwise
-never arrive at all. It is also how an oversized command response gets home:
-replies too large for the 256-byte LRT response window are held addressable
-under a synthetic id (`0xFF000000 | cmd_seq`) and can be pulled either way.
+The stream is the reason HRT exists on this payload. It is not a file transfer
+with the end left off, and the difference drives every decision:
 
-The file block is **separate from the response window**, not a reuse of it, so
-a transfer in progress and a command reply travel in the same LRT packet. If
-they shared one window, every command issued mid-transfer would stall it.
+* A **file transfer** must not lose a byte, so it queues. Latency does not
+  matter; completeness does.
+* A **stream** must not fall behind, so it discards. Completeness does not
+  matter; latency does. A stream that buffers whatever it cannot send has a
+  delay that only grows — after ten minutes of a closed HRT tap you are
+  watching ten-minute-old video.
+
+So frames go into a bounded ring and the **oldest is dropped** when it fills,
+and closing HRT flushes the ring rather than holding it. A rising drop count
+under load is correct operation, not a fault. Dropping requires whole frames,
+which is why `radcam/stream.py` parses the encoder's Annex-B output into access
+units rather than treating it as opaque bytes.
+
+Live video takes priority over file transfer on HRT, because it is the only
+traffic on the link whose value expires. When the encoder is between frames,
+that gap goes to file chunks — so a transfer running alongside a stream makes
+progress rather than starving.
+
+### The encoder is two processes, and the reason matters
+
+`rpicam-vid --codec h264` **does not work on this board**. The Pi 5 dropped the
+Pi 4's hardware H.264 encoder, there is no `/dev/video11`, and this build of
+rpicam-apps was compiled without libav. It answers *"Unable to find an
+appropriate H.264 codec"* and exits.
+
+So the camera emits raw YUV420 and **ffmpeg/libx264 encodes in software** — the
+same encoder `tools/bench-compression.py` measured. x264 runs with
+`sliced-threads=0:threads=1`: sliced threading splits each picture into one
+slice per core, which at 640x480 buys nothing and during bring-up produced four
+VCL NALs per frame, making a naive parser report 55 fps when the true rate was
+14. The parser handles multi-slice pictures correctly regardless — it tests
+`first_mb_in_slice` — but one slice per frame is simpler and lower latency.
+
+### Measured end to end
+
+Camera → libx264 → HRT packets → real tty → ground reassembly → decode:
+
+| Quantity | Result |
+|---|---|
+| Frame rate | **15.0 fps**, exactly as configured |
+| Bitrate | **584 kbit/s** against a 600 kbit/s target |
+| Keyframes | one per second, each carrying SPS+PPS+IDR |
+| Chunk CRC failures | **0** |
+| Frames delivered | 180 of 181 in the window |
+| Decode | 168 frames, 640x480 yuv420p, **no decoder errors** |
+
+Frames are self-describing — frame number, chunk index and count, keyframe flag
+— so a ground station can join mid-stream and start decoding at the next
+keyframe. There is no MEDIA_INFO for a stream, because a stream has no known
+length and no beginning the receiver is guaranteed to have seen.
+
+### Region of interest
+
+The sensor is 4208x3120 and the link carries perhaps 600 kbit/s. Streaming the
+whole frame spends almost all of it on detail the encoder then destroys.
+Instead the stream takes a **crop of `crop_w` x `crop_h` centred on a chosen
+sensor pixel** and scales it to the output size. Setting the crop equal to the
+output gives 1:1 sensor pixels — the region of interest at full native
+resolution, with nothing spent on the rest of the field.
+
+Everything is clamped rather than refused: a centre near the edge is pulled in
+so the box stays on the sensor, dimensions are forced even for YUV420, and the
+**effective values are reported in telemetry**, so what was applied is never in
+doubt.
 
 ## Error correction, not just detection
 
@@ -266,10 +322,10 @@ repairable.
 | Does not correct | two or more in a group — falls back to explicit RESEND |
 | Disable | `SET_FEC_GROUP` (0x77) with 0 |
 
-Measured end to end on the LRT path with 8% of replies dropped: parity rebuilt
-5 of 9 missing chunks unaided, RESEND recovered the remaining 4 (whose groups
-had lost two chunks, or lost their parity), and the file came out bit-exact
-with a matching whole-file CRC-32.
+Parity applies to HRT **file transfer**. The live stream does not carry parity:
+a video frame that arrives late is worthless, so spending 6.25% of the link on
+repairing one has the priorities backwards — H.264 recovers at the next
+keyframe, one second later, for free.
 
 **Why XOR rather than Reed-Solomon.** RS corrects more, but needs a field
 implementation and tables on a machine where the rule is stdlib only, and its
@@ -299,12 +355,12 @@ only hands it over, and **never does I/O while DICE is waiting**.
 
 ## Still open
 
-1. **Target ID is a placeholder (1).** Needs the real assignment before flight.
-2. **Endianness is assumed big.** One `stp-crc-solve.py` run against real
-   traffic settles it along with the CRC.
-3. **The LRT trailing 2 bytes are inferred to be CRC.** Set
-   `"lrt_trailer": "zero"` if the authoritative ICD says otherwise.
-4. **Stop-with-loss semantics are a guess.** See above.
-5. **No wire test against real DICE.** Verified in-process, through a PTY pair,
-   and for DE timing on the real UART — but the flight computer has not been
-   in the loop.
+1. **Stop-with-loss semantics are a guess.** The ICD names 0x86 but does not
+   define it, and says not to invent it. Implemented as stop plus a one-chunk
+   rewind; explicit RESEND remains the authoritative recovery path and does not
+   depend on the guess.
+2. **Initial HRT state is assumed disabled.** Conservative, and the ICD does
+   not state it.
+3. **No wire test against real DICE.** Verified in-process, through PTY pairs,
+   and on the real UART for DE timing and live video — but the flight computer
+   has not been in the loop.

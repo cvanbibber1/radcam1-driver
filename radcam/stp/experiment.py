@@ -53,15 +53,15 @@ import threading
 import time
 import zlib
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from ..framing import Frame
 from ..protocol import Err, Msg
 from . import lrt as L
 from .commands import CommandDecodeError, decode_command_payload
 from .fec import DEFAULT_GROUP_SIZE
-from .hrt import TransferManager
-from .lrtfile import LrtFileManager, PARITY_REQUEST_BIT
+from .hrt import (FLAG_KEYFRAME, FLAG_LAST_CHUNK, HRT_CHUNK_DATA, SubType,
+                  TransferManager, build_hrt_payload)
 from .packets import (
     DEFAULT_WIRE, PacketType, Wire, encode_command_ack, encode_hrt_data,
     encode_lrt_data,
@@ -86,14 +86,16 @@ class StpOp:
     ABORT_TRANSFERS = 0x71
     GET_LINK_STATS = 0x72
     SET_HRT_IDLE_FILL = 0x73
-    #: Pull a file down through LRT instead of HRT. The LRT path is slower but
-    #: needs no permission from DICE, so it is the downlink that always works.
-    LRT_FILE_START = 0x74
-    LRT_FILE_STOP = 0x75
-    LRT_FILE_RESEND = 0x76
-    #: Parity group size for both transfer paths; 0 disables forward error
+    #: Parity group size for HRT transfers; 0 disables forward error
     #: correction, larger is less overhead and less protection.
     SET_FEC_GROUP = 0x77
+    #: Live video over HRT. The stream shares the channel with file transfer
+    #: and takes priority while it is running, because it is the only traffic
+    #: on the link whose value expires.
+    STREAM_START = 0x78
+    STREAM_STOP = 0x79
+    STREAM_SET_REGION = 0x7A
+    STREAM_SET_OUTPUT = 0x7B
 
 
 #: Synthetic media ids for command responses too large for LRT. The high byte
@@ -103,14 +105,11 @@ _RESPONSE_ID_BASE = 0xFF000000
 #: Distinguishes "never seen this cmd_seq" from "seen, still running" (None).
 _UNSEEN = object()
 
-#: How many oversized command responses stay pullable. Bounded because each is
-#: held whole in RAM, and a stale reply is worth less than the memory.
-_RESPONSE_BLOB_DEPTH = 4
 
 
 @dataclass
 class ExperimentConfig:
-    target_id: int = 0x01
+    target_id: int = 0xC7
     version: str = "1.0"
     #: HRT payloads emitted per `service()` call. Bounds how long one pass can
     #: hold the bus, so a command arriving mid-transfer is not starved.
@@ -138,7 +137,7 @@ class Experiment:
     def __init__(self, link, wire: Wire = DEFAULT_WIRE,
                  dispatcher=None, store=None, state_provider=None,
                  config: ExperimentConfig | None = None,
-                 events: L.EventLog | None = None):
+                 events: L.EventLog | None = None, stream=None):
         self.link = link
         self.wire = wire
         self.dispatcher = dispatcher
@@ -154,13 +153,14 @@ class Experiment:
         self.transfers = TransferManager(
             reload=(store.read if store is not None else None),
             group_size=self.cfg.fec_group_size)
-        #: Oversized command responses, kept addressable so the ground can pull
-        #: one over LRT as well as HRT. Bounded: a stale response is worth far
-        #: less than the memory it holds.
-        self._response_blobs: OrderedDict[int, bytes] = OrderedDict()
-        self.lrt_files = LrtFileManager(
-            resolve=self._resolve_blob,
-            default_group_size=self.cfg.fec_group_size)
+        #: Live video. Constructed lazily on STREAM_START so that a payload
+        #: which never streams pays nothing for the capability.
+        self.stream = stream
+        self._stream_frame: bytes | None = None
+        self._stream_chunk = 0
+        self._stream_chunks = 0
+        self._stream_index = 0
+        self._stream_keyframe = False
 
         # REQUEST_MEDIA and RESEND are served from `self.store`, while
         # DELETE_MEDIA, GET_MEDIA_LIST and GET_DOSE_LOG are served from the
@@ -206,18 +206,6 @@ class Experiment:
         self._queue: queue.Queue = queue.Queue(maxsize=self.cfg.max_command_queue)
         self._worker: threading.Thread | None = None
         self._running = threading.Event()
-
-    def _resolve_blob(self, media_id: int) -> bytes | None:
-        """Bytes for an LRT file transfer: stored media, or a held response."""
-        if media_id in self._response_blobs:
-            return self._response_blobs[media_id]
-        if self.store is None:
-            return None
-        try:
-            return self.store.read(media_id)
-        except Exception as exc:                       # noqa: BLE001
-            log.error("reading media %d failed: %s", media_id, exc)
-            return None
 
     # ------------------------------------------------------------ lifecycle
 
@@ -394,51 +382,18 @@ class Experiment:
                 stats.not_for_us, stats.unknown_type, stats.resyncs,
                 stats.dropped_bytes, self._hrt_sent.value()))
 
-        if opcode == StpOp.LRT_FILE_START:
-            if len(request.args) < 4:
-                return self._fail(request, Err.BAD_PARAM)
-            media_id = struct.unpack("<I", request.args[:4])[0]
-            chunk_size = L.FILE_DATA_MAX
-            group_size = None
-            if len(request.args) >= 6:
-                chunk_size = struct.unpack("<H", request.args[4:6])[0] \
-                    or L.FILE_DATA_MAX
-            if len(request.args) >= 8:
-                group_size = struct.unpack("<H", request.args[6:8])[0]
-            if not self.lrt_files.start(media_id, chunk_size=chunk_size,
-                                        group_size=group_size):
-                return self._fail(request, Err.NO_MEDIA)
-            status = self.lrt_files.status()
-            self.events.add(L.EventCode.TRANSFER_STARTED, arg=media_id)
-            return self._succeed(request, struct.pack(
-                "<III", media_id, status["lrt_file_total"], chunk_size))
-
-        if opcode == StpOp.LRT_FILE_STOP:
-            stopped = self.lrt_files.stop()
-            return self._succeed(request, bytes([1 if stopped else 0]))
-
-        if opcode == StpOp.LRT_FILE_RESEND:
-            if len(request.args) < 8:
-                return self._fail(request, Err.BAD_PARAM)
-            media_id = struct.unpack("<I", request.args[:4])[0]
-            rest = request.args[4:]
-            wanted = [struct.unpack("<I", rest[i:i + 4])[0]
-                      for i in range(0, len(rest) - 3, 4)]
-            accepted = self.lrt_files.request_resend(media_id, wanted)
-            if not accepted:
-                return self._fail(request, Err.NO_MEDIA)
-            return self._succeed(request,
-                                 struct.pack("<II", media_id, accepted))
-
         if opcode == StpOp.SET_FEC_GROUP:
             if not request.args:
                 return self._fail(request, Err.BAD_PARAM)
             group = request.args[0]
             self.cfg.fec_group_size = group
             self.transfers.group_size = group
-            self.lrt_files.default_group_size = group
             log.info("FEC parity group size set to %d", group)
             return self._succeed(request, bytes([group]))
+
+        if opcode in (StpOp.STREAM_START, StpOp.STREAM_STOP,
+                      StpOp.STREAM_SET_REGION, StpOp.STREAM_SET_OUTPUT):
+            return self._stream_command(request)
 
         if opcode == StpOp.SET_HRT_IDLE_FILL:
             self.cfg.hrt_idle_fill = bool(request.args and request.args[0])
@@ -519,6 +474,152 @@ class Experiment:
             return self._fail(request, Err.NO_MEDIA)
         return self._succeed(request, struct.pack("<II", media_id, accepted))
 
+    # -- live stream ------------------------------------------------------
+
+    def _ensure_stream(self):
+        """Build the stream object on first use, not at construction.
+
+        Importing and constructing it eagerly would make every payload pay for
+        a capability most runs never use, and would make `radcam.stp` depend on
+        the camera stack even in tests that have no camera.
+        """
+        if self.stream is None:
+            from ..stream import VideoStream
+            self.stream = VideoStream()
+        return self.stream
+
+    def _stream_command(self, request) -> None:
+        from ..stream import StreamConfig
+
+        try:
+            stream = self._ensure_stream()
+        except Exception as exc:                       # noqa: BLE001
+            log.error("stream unavailable: %s", exc)
+            return self._fail(request, Err.CAMERA_FAULT)
+
+        opcode = request.opcode
+        current = stream.config
+
+        if opcode == StpOp.STREAM_STOP:
+            stopped = stream.stop()
+            self._drop_stream_frame()
+            self.events.add(L.EventCode.RECORD_STOPPED)
+            return self._succeed(request, bytes([1 if stopped else 0]))
+
+        if opcode == StpOp.STREAM_SET_REGION:
+            if len(request.args) < 8:
+                return self._fail(request, Err.BAD_PARAM)
+            cx, cy, cw, ch = struct.unpack("<4H", request.args[:8])
+            wanted = replace(current, centre_x=cx, centre_y=cy,
+                             crop_w=cw, crop_h=ch)
+        elif opcode == StpOp.STREAM_SET_OUTPUT:
+            if len(request.args) < 9:
+                return self._fail(request, Err.BAD_PARAM)
+            width, height, fps, bitrate = struct.unpack("<HHBI", request.args[:9])
+            wanted = replace(current, width=width, height=height,
+                             fps=fps, bitrate=bitrate)
+        else:                                          # STREAM_START
+            wanted = current
+            if len(request.args) >= 9:
+                width, height, fps, bitrate = struct.unpack(
+                    "<HHBI", request.args[:9])
+                wanted = replace(wanted, width=width, height=height,
+                                 fps=fps, bitrate=bitrate)
+            if len(request.args) >= 17:
+                cx, cy, cw, ch = struct.unpack("<4H", request.args[9:17])
+                wanted = replace(wanted, centre_x=cx, centre_y=cy,
+                                 crop_w=cw, crop_h=ch)
+
+        effective = wanted.sanitised()
+        was_running = stream.running
+
+        # A settings change restarts the encoder, because resolution, frame
+        # rate and region are all fixed at process start. Restarting only when
+        # something actually changed keeps a redundant command from putting a
+        # gap in a running stream.
+        if opcode == StpOp.STREAM_START or was_running:
+            if opcode == StpOp.STREAM_START or effective != current:
+                self._drop_stream_frame()
+                if not stream.start(effective):
+                    self.events.add(L.EventCode.CAPTURE_FAILED,
+                                    severity=L.SEV_ERROR)
+                    return self._fail(request, Err.CAMERA_FAULT)
+                self.events.add(L.EventCode.RECORD_STARTED,
+                                arg=effective.width)
+        else:
+            stream.config = effective
+
+        applied = stream.config
+        # Report what was actually applied, not what was asked for: the values
+        # are clamped to the sensor and to sane encoder limits, and the ground
+        # should never have to guess which.
+        return self._succeed(request, struct.pack(
+            "<HHBI4H", applied.width, applied.height, applied.fps,
+            applied.bitrate, applied.centre_x, applied.centre_y,
+            applied.crop_w, applied.crop_h))
+
+    def _drop_stream_frame(self) -> None:
+        self._stream_frame = None
+        self._stream_chunk = 0
+        self._stream_chunks = 0
+
+    def _stream_state(self) -> dict:
+        if self.stream is None:
+            return {"stream_state": L.STREAM_OFF}
+
+        stream = self.stream
+        state = dict(stream.status())
+        if stream.fault:
+            state["stream_state"] = L.STREAM_FAULT
+        elif stream.running:
+            state["stream_state"] = (L.STREAM_RUNNING if stream.frames_encoded
+                                     else L.STREAM_STARTING)
+        else:
+            state["stream_state"] = L.STREAM_OFF
+
+        flags = 0
+        if stream.running and not self._hrt_enabled.value():
+            flags |= L.STREAM_FLAG_GATED
+        if stream.encoder_late():
+            flags |= L.STREAM_FLAG_ENCODER_LATE
+        state["stream_flags"] = flags
+        return state
+
+    def _next_stream_payload(self) -> bytes | None:
+        """One HRT payload of live video, or None if no frame is ready."""
+        stream = self.stream
+        if stream is None or not stream.running:
+            return None
+
+        if self._stream_frame is None:
+            frame = stream.take()
+            if frame is None:
+                return None
+            self._stream_frame = frame.data
+            self._stream_index = frame.index
+            self._stream_keyframe = frame.keyframe
+            self._stream_chunk = 0
+            self._stream_chunks = max(
+                1, (len(frame.data) + HRT_CHUNK_DATA - 1) // HRT_CHUNK_DATA)
+
+        index = self._stream_chunk
+        start = index * HRT_CHUNK_DATA
+        piece = self._stream_frame[start:start + HRT_CHUNK_DATA]
+        self._stream_chunk += 1
+
+        # Read these before the frame state is cleared below: resetting first
+        # published chunk_total=0 on the final chunk of every frame, which is
+        # the one chunk a reassembler most needs it from.
+        frame_index, chunk_total = self._stream_index, self._stream_chunks
+
+        flags = FLAG_KEYFRAME if self._stream_keyframe else 0
+        if self._stream_chunk >= chunk_total:
+            flags |= FLAG_LAST_CHUNK
+            self._drop_stream_frame()
+
+        return build_hrt_payload(SubType.STREAM_DATA, frame_index,
+                                 index, chunk_total, piece, flags)
+
     # -- results ----------------------------------------------------------
 
     def _succeed(self, request, payload: bytes, resp_opcode: int | None = None) -> None:
@@ -527,15 +628,10 @@ class Experiment:
         self._record_result(request.opcode, request.cmd_seq, 0,
                             payload, resp_opcode)
         if len(payload) > L.RESP_DATA_MAX:
-            # Too big for the LRT response window. Offer it over HRT under a
-            # synthetic id the ground can recognise by its high byte, and keep
-            # the bytes addressable so the same id can be pulled over LRT if
-            # HRT never opens.
-            blob_id = _RESPONSE_ID_BASE | (request.cmd_seq & 0xFFFF)
-            self.transfers.enqueue(blob_id, payload)
-            self._response_blobs[blob_id] = payload
-            while len(self._response_blobs) > _RESPONSE_BLOB_DEPTH:
-                self._response_blobs.popitem(last=False)
+            # Too big for the LRT response window, so it goes over HRT under a
+            # synthetic id the ground can recognise by its high byte.
+            self.transfers.enqueue(_RESPONSE_ID_BASE | (request.cmd_seq & 0xFFFF),
+                                   payload)
 
     def _fail(self, request, code) -> None:
         self._cmds_rejected.add(1)
@@ -588,12 +684,8 @@ class Experiment:
     # ------------------------------------------------------------------ LRT
 
     def _send_lrt(self) -> None:
-        state = self.build_state()
-        # Exactly once per reply: next_block() advances the transfer, so it
-        # must not be called from build_state(), which tests and introspection
-        # also use.
-        state.update(self.lrt_files.next_block())
-        payload = L.build_lrt_payload(state, self.events.recent(L.MAX_EVENTS))
+        payload = L.build_lrt_payload(self.build_state(),
+                                      self.events.recent(L.MAX_EVENTS))
         if self._transmit(encode_lrt_data(payload, self.wire,
                                           self.cfg.target_id)):
             self._lrt_sent.add(1)
@@ -644,7 +736,8 @@ class Experiment:
             "xfer_queue_depth": self.transfers.pending,
         })
         state.update(self.transfers.status())
-        state.update(self.lrt_files.status())
+        state["fec_group_size"] = self.cfg.fec_group_size
+        state.update(self._stream_state())
         if self._safe_mode.value():
             state["xfer_state"] = L.XFER_PAUSED
         elif not self._hrt_enabled.value() and self.transfers.pending:
@@ -676,10 +769,22 @@ class Experiment:
 
     def _pump_hrt(self) -> None:
         if not self._hrt_enabled.value() or self._safe_mode.value():
+            # The tap is shut. Anything the encoder has already produced is
+            # only going to get staler, so throw it away rather than send
+            # history when the tap reopens.
+            if self.stream is not None and self.stream.running:
+                self._drop_stream_frame()
+                self.stream.flush()
             return
 
         for _ in range(self.cfg.hrt_packets_per_service):
-            payload = self.transfers.next_payload()
+            # Live video first. It is the only traffic on this link whose value
+            # expires, and a file transfer waiting a few seconds loses nothing.
+            # When no frame is ready the encoder is between frames, and that
+            # gap is exactly when a file chunk should use the link.
+            payload = self._next_stream_payload()
+            if payload is None:
+                payload = self.transfers.next_payload()
             if payload is None:
                 if self.cfg.hrt_idle_fill:
                     payload = b"\x00" * 1280

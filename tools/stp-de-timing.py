@@ -50,6 +50,8 @@ def main() -> int:
     ap.add_argument("--port", default="/dev/ttyAMA0")
     ap.add_argument("--baud", type=int, default=921600)
     ap.add_argument("--de-gpio", type=int, default=4)
+    ap.add_argument("--target", type=lambda v: int(v, 0), default=0xC7,
+                    help="our Target ID (default 0xC7)")
     ap.add_argument("--no-de", action="store_true",
                     help="do not drive DE (only safe if nothing shares the bus)")
     ap.add_argument("-n", "--repeats", type=int, default=10)
@@ -57,7 +59,7 @@ def main() -> int:
                     help="also measure sustained HRT rate")
     args = ap.parse_args()
 
-    wire = P.Wire(target_id=1)
+    wire = P.Wire(target_id=args.target)
     de = NullDeLine() if args.no_de else DeLine(gpio=args.de_gpio)
     link = Rs422Link(port=args.port, baud=args.baud, de=de)
 

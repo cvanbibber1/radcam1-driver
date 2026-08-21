@@ -1,6 +1,6 @@
 # Development State
 
-**Last updated:** 2026-08-20 — **RS-422 VERIFIED; LRT FILE TRANSFER + FEC ADDED**
+**Last updated:** 2026-08-20 — **RS-422 VERIFIED; LIVE VIDEO OVER HRT WORKING**
 **Read `CLAUDE.md` first** for the stable hardware map, `docs/stp/README.md`
 for the RS-422 interface, and `HANDOFF.md` for blocked work.
 
@@ -22,28 +22,52 @@ python3 -m unittest discover -s tests -t .      # 125 tests
 
 | Check | Result |
 |---|---|
-| Unit tests | **158 pass** |
-| Reliability / safety / autonomy | **81/81 pass** |
+| Unit tests | **176 pass** |
+| Reliability / safety / autonomy | **85/85 pass** |
 | Simulator conversation | **21/21 pass** |
+| Live video, camera to decoded frames | **15.0 fps, 584 kbit/s, 0 CRC failures** |
 | End-to-end through a real tty (PTY) | 49-chunk 61440 B file, bit-exact, CRC match |
 | DE assertion excess | **~30 µs flat**, any packet size |
 | Sustained HRT | **89.2 kB/s payload, 99.7% wire utilisation** |
 | Idle CPU | 0.85% |
 
+### Mission parameters confirmed 2026-08-20
+
+Target ID **0xC7**, big-endian, CRC-16/CCITT-FALSE, and the CRC is the **final
+two bytes of every message** — the last of which had been an inference, since
+the supplied ICD excerpt accounted for only 1254 of the LRT packet's 1256
+bytes. It is now asserted for all six message types in the test suite.
+
 ### Added 2026-08-20
 
-- **File transfer over LRT** (`radcam/stp/lrtfile.py`). HRT only flows when DICE
-  opens the tap, so an HRT-only payload cannot return an image if the master
-  never does. The LRT file block carries 512 B per poll — ~18x slower, but it
-  needs no permission from anyone.
-- **Forward error correction** (`radcam/stp/fec.py`). XOR parity every
-  `fec_group_size` chunks on both paths: one lost chunk per group is rebuilt on
-  the ground with no retransmission, at 6.25% overhead. Measured with 8% of LRT
-  replies dropped, parity rebuilt 5 of 9 missing chunks unaided and resend
-  covered the rest; the file came out bit-exact.
-- **Wire format verified against the ICD.** Sync transmits as `1A CF FC 1D`,
-  confirming big-endian; every packet type was transmitted on the real UART and
-  round-tripped through real ttys.
+- **Live video over HRT** (`radcam/stream.py`). 640x480 at 15 fps, 600 kbit/s,
+  crop box centred on any sensor pixel. Measured camera-to-decoded-frames:
+  15.0 fps, 584 kbit/s, keyframe per second, 0 chunk CRC failures, decodes
+  clean. A stream **drops rather than queues** — buffering on a
+  flow-controlled link turns a bandwidth shortfall into unbounded latency.
+- **Forward error correction** (`radcam/stp/fec.py`) on HRT file transfer. XOR
+  parity every `fec_group_size` chunks: one lost chunk per group rebuilt with
+  no retransmission, 6.25% overhead. Not applied to live video, where a late
+  frame is worthless.
+- **LRT is now vitals only.** The contingency file-transfer block was removed;
+  that returned the command-response window to 512 B and the event ring from 19
+  entries to 40.
+- **Wire format verified against the ICD.** Sync transmits as `1A CF FC 1D`;
+  every packet type was transmitted on the real UART and round-tripped through
+  real ttys.
+
+### Three more bugs found by testing
+
+- **`chunk_total` read 0 on the final chunk of every stream frame** — the frame
+  state was reset before the payload was built, and the last chunk is the one a
+  reassembler most needs the total from.
+- **A start code at the very end of a read went undetected**, deferring a whole
+  NAL to the next read. Benign but real: an off-by-one in the scan bounds.
+- **`rpicam-vid --codec h264` does not work on a Pi 5** — no hardware encoder,
+  and rpicam-apps built without libav. Replaced with a
+  `rpicam-vid --codec yuv420 | ffmpeg -c:v libx264` pipeline. x264's sliced
+  threading also had to be disabled: it emitted four VCL NALs per picture and
+  made a naive access-unit parser report 55 fps when the true rate was 14.
 
 ### Three bugs found by testing, all real
 
@@ -65,16 +89,12 @@ convention rather than a 30-site rewrite — see `docs/stp/README.md`.
 
 ### Still assumed, not confirmed
 
-1. **Target ID is a placeholder (1).** Needs the real assignment.
-2. **Endianness is big-endian**, matching the ICD's `0x1ACF FC1D` written most
-   significant byte first — verified on the wire. The CRC parameters remain
-   mission-stated rather than confirmed against DICE;
-   `tools/stp-crc-solve.py` settles that from one capture.
-3. **LRT trailing 2 bytes inferred to be CRC** (the ICD's rows account for only
-   1254 of 1256 bytes).
-4. **Stop-with-loss (0x86) semantics are a guess** — the ICD names it but does
-   not define it. Implemented as stop + rewind one chunk.
-5. **Never tested against real DICE hardware.**
+1. ~~Target ID~~ — **assigned: 0xC7.**
+2. **Stop-with-loss (0x86) semantics are a guess** — the ICD names it but does
+   not define it. Implemented as stop + rewind one chunk; explicit RESEND is
+   the authoritative recovery path and does not depend on the guess.
+3. **Initial HRT state assumed disabled.** Conservative; the ICD is silent.
+4. **Never tested against real DICE hardware.**
 
 ---
 

@@ -43,6 +43,7 @@ from .stp.experiment import Experiment, ExperimentConfig
 from .stp.link import DeLine, NullDeLine, Rs422Link
 from .stp.lrt import EventCode, EventLog
 from .stp.packets import Wire
+from .stream import StreamConfig, VideoStream
 
 log = logging.getLogger("radcamd")
 
@@ -219,6 +220,7 @@ class Daemon:
         # experiments, and an unsolicited byte corrupts somebody else's reply.
         self.stp: Experiment | None = None
         self.stp_link: Rs422Link | None = None
+        self.stream: VideoStream | None = None
         self.stp_events = EventLog()
         self._stp_thread = None
         self._stp_state: dict = {}
@@ -243,7 +245,7 @@ class Daemon:
         wire = Wire(
             big_endian=bool(cfg.get("big_endian", True)),
             crc=crc,
-            target_id=int(cfg.get("target_id", 1)),
+            target_id=int(cfg.get("target_id", 0xC7)),
             crc_start=int(cfg.get("crc_start", 4)),
             lrt_trailer=str(cfg.get("lrt_trailer", "crc")),
         )
@@ -262,10 +264,26 @@ class Daemon:
             setup_us=float(cfg.get("de_setup_us", 10.0)),
             discard_echo=bool(cfg.get("discard_echo", True)))
 
+        # Live video is constructed but not started: the encoder is a real
+        # cost in CPU and power, and nothing should be running until the
+        # ground asks for it.
+        stream_cfg = cfg.get("stream") or {}
+        self.stream = VideoStream(
+            StreamConfig(
+                width=int(stream_cfg.get("width", 640)),
+                height=int(stream_cfg.get("height", 480)),
+                fps=int(stream_cfg.get("fps", 15)),
+                bitrate=int(stream_cfg.get("bitrate", 600_000)),
+                centre_x=int(stream_cfg.get("centre_x", 4208 // 2)),
+                centre_y=int(stream_cfg.get("centre_y", 3120 // 2)),
+                crop_w=int(stream_cfg.get("crop_w", 640)),
+                crop_h=int(stream_cfg.get("crop_h", 480))),
+            queue_frames=int(stream_cfg.get("queue_frames", 8)))
+
         self.stp = Experiment(
             link=self.stp_link, wire=wire, dispatcher=self.dispatcher,
             store=self.media, state_provider=lambda: self._stp_state,
-            events=self.stp_events,
+            events=self.stp_events, stream=self.stream,
             config=ExperimentConfig(
                 target_id=wire.target_id,
                 version=str(cfg.get("version", "1.0")),
@@ -282,6 +300,11 @@ class Daemon:
         log.info("STP enabled: target 0x%02X, %s at %d baud, DE on GPIO%s",
                  wire.target_id, self.stp_link.port, self.stp_link.baud,
                  de_gpio)
+        log.info("live stream configured (not started): %s",
+                 self.stream.config.describe())
+        if not self.stream.available:
+            log.warning("live stream unavailable, missing: %s",
+                        ", ".join(self.stream.missing()))
 
     def _boot_count(self) -> int:
         """Persisted across reboots so the ground can see resets happening."""
@@ -436,6 +459,13 @@ class Daemon:
         self.running = False
 
     def shutdown(self) -> None:
+        if self.stream is not None:
+            # Two child processes; leaving them behind would hold the camera
+            # against the next start.
+            try:
+                self.stream.stop()
+            except Exception as exc:                   # noqa: BLE001
+                log.error("stopping the stream failed: %s", exc)
         if self.stp is not None:
             try:
                 self.stp.stop()

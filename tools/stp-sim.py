@@ -179,78 +179,68 @@ class Dice:
                 return item["data"]
         return None
 
-    def download_lrt(self, media_id: int, max_polls: int = 4000,
-                     group_size: int | None = None) -> bytes | None:
-        """Pull a file through LRT polls, repairing losses from parity.
+    def watch_stream(self, seconds: float = 10.0, out_path: str | None = None):
+        """Open HRT, reassemble live video frames, optionally save them.
 
-        This is the downlink that needs no permission from the master. It is
-        much slower than HRT, and it is the one that always works.
+        Frames are self-describing - frame number, chunk index and count, and a
+        keyframe flag - so this can start mid-stream. It waits for the first
+        keyframe before writing anything, because a decoder handed inter frames
+        with no reference produces garbage.
         """
-        args = struct.pack("<I", media_id)
-        if group_size is not None:
-            args += struct.pack("<HH", 0, group_size)
-        self.command(StpOp.LRT_FILE_START, args)
+        self.short(P.PacketType.HRT_GO)
+        partial: dict[int, dict[int, bytes]] = {}
+        totals: dict[int, int] = {}
+        keyframes: set[int] = set()
+        complete: list[tuple[int, bytes]] = []
+        bad_chunks = 0
+        started = time.time()
+
+        while time.time() - started < seconds:
+            for item in self.collect(settle=0.02):
+                if item["kind"] != "HRT":
+                    continue
+                payload = item["data"]
+                if payload["sub_type"] != H.SubType.STREAM_DATA:
+                    continue
+                if not payload["data_crc_ok"]:
+                    bad_chunks += 1
+                    continue
+                frame = payload["media_id"]
+                partial.setdefault(frame, {})[payload["chunk_index"]] = payload["data"]
+                totals[frame] = payload["chunk_total"]
+                if payload["keyframe"]:
+                    keyframes.add(frame)
+                if len(partial[frame]) == totals[frame]:
+                    data = b"".join(partial[frame][i] for i in range(totals[frame]))
+                    complete.append((frame, data))
+                    del partial[frame]
+
+        self.short(P.PacketType.HRT_STOP)
         self.collect()
 
-        data: dict[int, bytes] = {}
-        parity: dict[int, bytes] = {}
-        final = None
+        complete.sort()
+        self.say(f"<- {len(complete)} complete frames, {len(partial)} partial, "
+                 f"{bad_chunks} chunks failed CRC")
+        if complete:
+            span = complete[-1][0] - complete[0][0] + 1
+            self.say(f"   frames {complete[0][0]}..{complete[-1][0]}, "
+                     f"{len(complete)}/{span} arrived, "
+                     f"{len(keyframes)} keyframes")
+            self.say(f"   {sum(len(d) for _, d in complete)} bytes in "
+                     f"{seconds:.0f}s = "
+                     f"{sum(len(d) for _, d in complete) * 8 / seconds / 1000:.0f} kbit/s")
 
-        for _ in range(max_polls):
-            report = self.poll_lrt()
-            if report is None:
-                continue
-            state = report["file_state"]
-            if state == L.FILE_COMPLETE:
-                final = report
-                break
-            if state != L.FILE_ACTIVE:
-                continue
-            if not report["file_data_crc_ok"]:
-                self.say(f"   chunk {report['file_chunk_index']} failed CRC")
-                continue
-            if report["file_is_parity"]:
-                parity[report["file_chunk_index"]] = report["file_data"]
-            else:
-                data[report["file_chunk_index"]] = report["file_data"]
-
-        if final is None:
-            self.say("!! LRT transfer did not complete")
-            return None
-
-        total = final["file_chunk_total"]
-        group = final["file_fec_group"]
-        self.say(f"<- LRT transfer: {len(data)}/{total} chunks, "
-                 f"{len(parity)} parity, {final['file_size']} bytes")
-
-        stats = fec.FecStats()
-        missing = fec.verify_and_repair(data, parity, total, group,
-                                        L.FILE_DATA_MAX, stats)
-        if stats.recovered:
-            self.say(f"   parity rebuilt {stats.recovered} chunk(s) with no "
-                     f"retransmission")
-
-        if missing:
-            self.say(f"   requesting resend of {len(missing)} chunk(s)")
-            self.command(StpOp.LRT_FILE_RESEND, struct.pack("<I", media_id)
-                         + b"".join(struct.pack("<I", i) for i in missing[:24]))
-            self.collect()
-            for _ in range(len(missing) + 8):
-                report = self.poll_lrt()
-                if report and report["file_state"] == L.FILE_ACTIVE \
-                        and report["file_data_crc_ok"] \
-                        and not report["file_is_parity"]:
-                    data[report["file_chunk_index"]] = report["file_data"]
-            missing = [i for i in range(total) if i not in data]
-
-        if missing:
-            self.say(f"!! still missing {len(missing)} chunk(s)")
-            return None
-
-        blob = b"".join(data[i] for i in range(total))[:final["file_size"]]
-        ok = (zlib.crc32(blob) & 0xFFFFFFFF) == final["file_crc32"]
-        self.say(f"<- reassembled {len(blob)} bytes, CRC {'OK' if ok else 'BAD'}")
-        return blob if ok else None
+        if out_path and complete:
+            first_key = next((i for i, (n, _) in enumerate(complete)
+                              if n in keyframes), None)
+            if first_key is None:
+                self.say("   no keyframe seen; nothing written")
+                return complete
+            with open(out_path, "wb") as handle:
+                for _, data in complete[first_key:]:
+                    handle.write(data)
+            self.say(f"   wrote {out_path} from the first keyframe onward")
+        return complete
 
     def download(self, media_id: int, max_rounds: int = 4000) -> bytes | None:
         """Full media transfer: request, open the tap, reassemble, verify."""
@@ -395,7 +385,8 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", help="serial device; omit for in-process")
     ap.add_argument("--baud", type=int, default=921600)
-    ap.add_argument("--target", type=int, default=1)
+    ap.add_argument("--target", type=lambda v: int(v, 0), default=0xC7,
+                    help="Target ID of the experiment (default 0xC7)")
     ap.add_argument("--little-endian", action="store_true")
     ap.add_argument("--crc", default="CRC-16/CCITT-FALSE")
     ap.add_argument("--ping", action="store_true")
@@ -450,10 +441,31 @@ def main() -> int:
         if args.hrt_stop:
             dice.short(P.PacketType.HRT_STOP)
             pump()
-        if args.lrt_download is not None:
-            blob = dice.download_lrt(args.lrt_download,
-                                     group_size=args.fec_group)
-            print("downloaded", len(blob) if blob else 0, "bytes over LRT")
+        if args.stream_size:
+            spec, _, kbps = args.stream_size.partition(":")
+            dims, _, fps = spec.partition("@")
+            width, _, height = dims.partition("x")
+            dice.command(StpOp.STREAM_SET_OUTPUT,
+                         struct.pack("<HHBI", int(width), int(height),
+                                     int(fps or 15), int(kbps or 600) * 1000))
+            pump()
+            dice.collect()
+        if args.stream_region:
+            cx, cy, w, h = (int(v) for v in args.stream_region.split(","))
+            dice.command(StpOp.STREAM_SET_REGION,
+                         struct.pack("<4H", cx, cy, w, h))
+            pump()
+            dice.collect()
+        if args.stream_start:
+            dice.command(StpOp.STREAM_START)
+            pump()
+            dice.collect()
+        if args.stream_stop:
+            dice.command(StpOp.STREAM_STOP)
+            pump()
+            dice.collect()
+        if args.watch_stream is not None:
+            dice.watch_stream(args.watch_stream, args.stream_out)
         if args.download is not None:
             if experiment is not None:
                 print("!! --download needs --port; in-process use --self-test")
@@ -461,7 +473,10 @@ def main() -> int:
                 blob = dice.download(args.download)
                 print("downloaded", len(blob) if blob else 0, "bytes")
         if args.lrt or not any((args.ping, args.capture, args.download,
-                                args.lrt_download, args.hrt_go, args.hrt_stop)):
+                                args.hrt_go, args.hrt_stop, args.stream_start,
+                                args.stream_stop, args.stream_size,
+                                args.stream_region,
+                                args.watch_stream is not None)):
             dice.short(P.PacketType.LRT_REQUEST)
             pump()
             for item in dice.collect():
@@ -578,37 +593,32 @@ def self_test(dice: "Dice", experiment, bus) -> int:
           experiment._cmds_executed.value() - before == 1,
           f"executed {experiment._cmds_executed.value() - before}")
 
-    print("\nLRT file transfer (no HRT permission)")
+    print("\nLive stream configuration")
     dice.collect()
-    dice.command(StpOp.LRT_FILE_START, struct.pack("<I", 2))
+    dice.command(StpOp.STREAM_SET_REGION, struct.pack("<4H", 3000, 2000, 512, 512))
     pump()
     dice.collect()
-    lrt_data, lrt_parity, lrt_final = {}, {}, None
-    for _ in range(80):
-        pump(2)
-        dice.short(P.PacketType.LRT_REQUEST)
-        pump(1)
-        for item in dice.collect(settle=0.0):
-            if item["kind"] != "LRT":
-                continue
+    report = None
+    dice.short(P.PacketType.LRT_REQUEST)
+    pump(1)
+    for item in dice.collect(settle=0.0):
+        if item["kind"] == "LRT":
             report = item["data"]
-            if report["file_state"] == L.FILE_COMPLETE:
-                lrt_final = report
-            elif report["file_state"] == L.FILE_ACTIVE and report["file_data_crc_ok"]:
-                if report["file_is_parity"]:
-                    lrt_parity[report["file_chunk_index"]] = report["file_data"]
-                else:
-                    lrt_data[report["file_chunk_index"]] = report["file_data"]
-        if lrt_final:
-            break
-    check("LRT transfer completes with HRT closed", lrt_final is not None)
-    check("HRT was never opened", not experiment._hrt_enabled.value())
-    if lrt_final:
-        blob = b"".join(lrt_data[i] for i in sorted(lrt_data))[:lrt_final["file_size"]]
-        check("LRT file CRC matches",
-              (zlib.crc32(blob) & 0xFFFFFFFF) == lrt_final["file_crc32"])
-        check("parity chunks were emitted", bool(lrt_parity),
-              f"{len(lrt_parity)} parity chunk(s)")
+    check("region is applied and echoed in telemetry",
+          report is not None and report["stream_centre_x"] == 3000
+          and report["stream_crop_w"] == 512,
+          f"centre={report['stream_centre_x'] if report else '?'}")
+    dice.command(StpOp.STREAM_SET_REGION, struct.pack("<4H", 5, 5, 1024, 1024))
+    pump()
+    dice.collect()
+    dice.short(P.PacketType.LRT_REQUEST)
+    pump(1)
+    for item in dice.collect(settle=0.0):
+        if item["kind"] == "LRT":
+            report = item["data"]
+    check("a region off the sensor edge is clamped, and the clamp reported",
+          report is not None and report["stream_centre_x"] == 512,
+          f"centre={report['stream_centre_x'] if report else '?'}")
 
     print("\nCorruption")
     pump()

@@ -54,7 +54,7 @@ log = logging.getLogger(__name__)
 __all__ = [
     "HRT_PAYLOAD_LEN", "HRT_HEADER_LEN", "HRT_CHUNK_DATA", "SubType",
     "build_hrt_payload", "decode_hrt_payload", "Transfer", "TransferManager",
-    "FLAG_LAST_CHUNK", "FLAG_RETRANSMIT", "FLAG_PARITY",
+    "FLAG_LAST_CHUNK", "FLAG_RETRANSMIT", "FLAG_PARITY", "FLAG_KEYFRAME",
 ]
 
 HRT_PAYLOAD_LEN = 1280
@@ -73,6 +73,13 @@ class SubType:
     #: See `radcam/stp/fec.py` - lets the ground rebuild any single chunk lost
     #: per group without asking for a retransmission.
     MEDIA_PARITY = 0x0004
+    #: One chunk of a live video frame. `media_id` carries the frame number and
+    #: `chunk_total` the chunks in that frame, so the reassembler needs no
+    #: prior announcement - unlike a file, a stream has no MEDIA_INFO because
+    #: it has no known length and no beginning the receiver is guaranteed to
+    #: have seen. Frames are self-describing so a ground station can join at
+    #: any point and start decoding from the next keyframe.
+    STREAM_DATA = 0x0005
 
 
 #: Set on the last data chunk of a file, so a reassembler that missed the
@@ -83,6 +90,9 @@ FLAG_RETRANSMIT = 0x0002
 #: Set on a MEDIA_PARITY payload, so a reassembler cannot mistake parity for
 #: file data even if it ignores sub_type.
 FLAG_PARITY = 0x0004
+#: Set on every chunk of a stream frame that carries SPS/PPS and an IDR - the
+#: frames a late-joining receiver can start decoding from.
+FLAG_KEYFRAME = 0x0008
 
 
 def build_hrt_payload(sub_type: int, media_id: int = 0, chunk_index: int = 0,
@@ -121,6 +131,7 @@ def decode_hrt_payload(payload: bytes) -> dict:
         "last_chunk": bool(flags & FLAG_LAST_CHUNK),
         "retransmit": bool(flags & FLAG_RETRANSMIT),
         "parity": bool(flags & FLAG_PARITY) or sub_type == SubType.MEDIA_PARITY,
+        "keyframe": bool(flags & FLAG_KEYFRAME),
     }
 
 

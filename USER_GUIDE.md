@@ -178,20 +178,22 @@ transmits unless spoken to.**
 |---|---|
 | Port | `/dev/ttyAMA0`, 921600 baud, 8N1 |
 | Transceiver | ADM2582E, driver enable on **GPIO4** |
-| Our address | Target ID 1 (`"target_id"` in the config) |
-| Byte order | big-endian; sync pattern `1A CF FC 1D` |
-| CRC | CRC-16/CCITT-FALSE over `packet[4:crc]` |
+| Our address | **Target ID `0xC7`** |
+| Byte order | **big-endian**; sync pattern `1A CF FC 1D` |
+| CRC | CRC-16/CCITT-FALSE, always the **final two bytes** of every message |
 
 Three things travel over it:
 
 - **Commands** (120 bytes, in) get an 8-byte acknowledgement. That ACK has no
   status field in the spec, so it means *accepted*, never *done* — the result
-  comes back in the next telemetry poll.
-- **LRT** (low rate telemetry) is the housekeeping channel, polled by DICE. It
-  carries dose, temperature, storage, link health, the last command's result,
-  recent events, and optionally a file chunk.
-- **HRT** (high rate telemetry) is the bulk channel for images and video. It
-  only flows between an `HRT Go` and a `Stop` from DICE.
+  comes back in the next telemetry poll, tagged with the sequence number you
+  sent.
+- **LRT** (low rate telemetry) is **vitals only**: dose, temperature, storage,
+  link health, the last command's result, and a ring of recent events. No bulk
+  data ever travels on LRT.
+- **HRT** (high rate telemetry) carries **live video** and **chunked file
+  transfer** of stored media. It only flows between an `HRT Go` and a `Stop`
+  from DICE.
 
 ### Trying it without a flight computer
 
@@ -202,43 +204,84 @@ python3 tools/stp-sim.py --self-test
 ```
 
 That runs a full conversation — command/ACK, telemetry poll, an HRT file
-transfer, an LRT file transfer, target filtering, duplicate suppression, and
-recovery from corrupted input — and prints PASS or FAIL for each. All checks
-should pass.
+transfer, live-stream configuration, target filtering, duplicate suppression,
+and recovery from corrupted input — and prints PASS or FAIL for each.
 
-Talk to a real payload over a wire:
+Talk to a real payload over a wire (note the target ID):
 
 ```bash
-python3 tools/stp-sim.py --port /dev/ttyAMA0 --baud 921600 --target 1 --lrt
-python3 tools/stp-sim.py --port /dev/ttyAMA0 --ping
-python3 tools/stp-sim.py --port /dev/ttyAMA0 --download 1        # over HRT
-python3 tools/stp-sim.py --port /dev/ttyAMA0 --lrt-download 1    # over LRT
+python3 tools/stp-sim.py --port /dev/ttyAMA0 --target 0xC7 --lrt
+python3 tools/stp-sim.py --port /dev/ttyAMA0 --target 0xC7 --ping
+python3 tools/stp-sim.py --port /dev/ttyAMA0 --target 0xC7 --download 1
 ```
 
-### Getting a file down: two paths
+### Live video
 
-| Path | Per packet | Speed | Needs |
-|---|---:|---|---|
-| **HRT** | 1256 B | ~89 kB/s | DICE to send `HRT Go` |
-| **LRT** | 512 B | ~5 kB/s at 10 polls/s | nothing |
+This is what HRT is really for. The payload encodes H.264 and streams it as
+frames are produced.
 
-HRT is roughly eighteen times faster and is the normal choice. LRT exists
-because HRT needs permission the payload cannot grant itself: if the master
-never opens the tap, LRT is the only way an image comes home. A 3 MB image is
-about 35 seconds over HRT and about ten minutes over LRT.
+```bash
+# Aim a 640x480 native-resolution box at the centre of the sensor, and start.
+python3 tools/stp-sim.py --port /dev/ttyAMA0 --target 0xC7     --stream-region 2104,1560,640,480     --stream-size 640x480@15:600 --stream-start
 
-### Error correction
+# Watch for 20 seconds and save what arrives.
+python3 tools/stp-sim.py --port /dev/ttyAMA0 --target 0xC7     --watch-stream 20 --stream-out /tmp/live.h264
 
-Chunks can be lost. Every chunk carries a CRC-32 so damage is *detected*, and
-every 16 chunks are followed by an XOR parity chunk so a single loss per group
-is *corrected* — reconstructed on the ground with nothing asked in return, at
+python3 tools/stp-sim.py --port /dev/ttyAMA0 --target 0xC7 --stream-stop
+ffplay /tmp/live.h264          # or: ffmpeg -i /tmp/live.h264 out.mp4
+```
+
+Measured end to end on this hardware at 640x480, 15 fps, 600 kbit/s requested:
+
+| Quantity | Result |
+|---|---|
+| Frame rate | **15.0 fps** |
+| Bitrate | **584 kbit/s** |
+| Keyframes | one per second |
+| Chunk CRC failures | **0** |
+| Decode | 168 frames, 640x480, **no decoder errors** |
+
+**A stream drops, it does not queue.** If the link cannot keep up, or DICE
+closes HRT, the oldest frames are discarded rather than buffered. A rising
+`stream_frames_dropped` under load is correct behaviour — buffering would mean
+a delay that only grows, and ten-minute-old video is worse than none. Live
+video takes priority over file transfer on HRT; file chunks use the gaps
+between frames, so a transfer alongside a stream still makes progress.
+
+### Pointing the camera without moving it
+
+The sensor is 4208x3120 but the link carries only ~600 kbit/s. Streaming the
+whole frame spends nearly all of it on detail the encoder then throws away.
+Instead, choose a **box centred on any sensor pixel**:
+
+```bash
+# 512x512 at native resolution, centred on sensor pixel (3000, 2000)
+--stream-region 3000,2000,512,512 --stream-size 512x512@15:600
+```
+
+When the crop equals the output size you get **1:1 sensor pixels** — full
+optical detail of just the area you care about. A crop larger than the output
+is scaled down, giving a wider view with less detail. Everything is clamped to
+the sensor and echoed back in telemetry, so a box asked for near the edge comes
+back as the box actually applied.
+
+### Getting a stored file down
+
+Files go over HRT in numbered chunks, each with its own CRC-32:
+
+```bash
+python3 tools/stp-sim.py --port /dev/ttyAMA0 --target 0xC7 --download 1
+```
+
+Every 16 chunks are followed by an XOR parity chunk, so **a single lost chunk
+per group is reconstructed on the ground with nothing asked in return**, at
 6.25% bandwidth cost. Losses beyond that fall back to an explicit resend.
+Tune or disable it with `SET_FEC_GROUP` (0x77) — larger groups mean less
+overhead and less protection, and 0 turns parity off.
 
-Measured with 8% of replies dropped: parity rebuilt 5 of 9 missing chunks
-unaided, a resend fetched the remaining 4, and the file came out bit-exact.
-
-Tune or disable it with `SET_FEC_GROUP` (0x77): larger groups mean less
-overhead and less protection; 0 turns parity off.
+Parity deliberately does *not* apply to live video: a video frame that arrives
+late is worthless, and H.264 recovers at the next keyframe a second later for
+free.
 
 ### Checking the link on real hardware
 
@@ -258,22 +301,18 @@ Healthy output is a flat **~25–35 µs excess at every packet size** and about
 size, the transmitter has fallen back to `tcdrain()` — check the log line
 printed when the link opens for which release method is in use.
 
-### If the CRC or byte order turns out to be wrong
+### If the CRC or byte order ever looks wrong
 
-The specification leaves the CRC parameters and endianness undefined; the
-values above are what the mission stated. If the link does not work against the
-real flight computer, capture some of its traffic and let the solver identify
-the real parameters:
+The values above are mission-confirmed, but the original specification left
+them undefined. If the link does not work against the real flight computer,
+capture some of its traffic and let the solver identify the real parameters:
 
 ```bash
 python3 tools/stp-crc-solve.py --bin capture.bin
 ```
 
 It searches 15 standard CRC-16 variants across both byte orders and three
-coverage ranges, and prints the exact config change needed. Three or more
-captured packets give a confident answer.
-
----
+coverage ranges, and prints the exact config change needed.
 
 ## 7. Configuration
 
@@ -291,12 +330,17 @@ The keys that matter most:
 | `interval_s` | housekeeping sample period, seconds |
 | `led_enabled`, `led_brightness` | illumination; brightness is still capped at 10% |
 | `stp.enabled` | turn the flight link on; **replaces** the old debug protocol |
-| `stp.target_id` | our address on the bus |
+| `stp.target_id` | our address on the bus — **`199` (0xC7)** |
 | `stp.baud` | 921600 |
 | `stp.de_gpio` | driver enable pin, 4 on this board |
 | `stp.big_endian` | `true` |
 | `stp.crc_variant` | `"CRC-16/CCITT-FALSE"` |
-| `stp.fec_group_size` | chunks per parity chunk; 0 disables correction |
+| `stp.fec_group_size` | chunks per parity chunk on HRT transfers; 0 disables |
+| `stream.width`, `stream.height` | stream output size, default 640x480 |
+| `stream.fps`, `stream.bitrate` | default 15 fps, 600000 bit/s |
+| `stream.centre_x`, `stream.centre_y` | sensor pixel the crop box is centred on |
+| `stream.crop_w`, `stream.crop_h` | crop size; equal to output means native pixels |
+| `stream.queue_frames` | frames buffered before the oldest is dropped |
 
 > With `stp.enabled` true, the flight port belongs to the RS-422 link and the
 > readable ASCII beacon goes only to the debug mirror on GPIO23/24. This is
@@ -308,15 +352,17 @@ The keys that matter most:
 ## 8. Testing and verification
 
 ```bash
-python3 -m unittest discover -s tests -t .   # 158 tests, ~17 s
-python3 tools/stp-verify.py                  # 81 reliability/safety/autonomy checks
+python3 -m unittest discover -s tests -t .   # 176 tests, ~17 s
+python3 tools/stp-verify.py                  # 85 reliability/safety/autonomy checks
 python3 tools/stp-sim.py --self-test         # 21 protocol checks
 ```
 
 `stp-verify.py` is the adversarial one: it fuzzes the receiver with random
 bytes, corrupts every byte position of a command, exhausts queues, forces
 transmit failures, simulates bit flips in memory, and drops packets mid-transfer
-to confirm the parity actually repairs them. Run the suites separately with
+to confirm the parity actually repairs them, and checks that live video is
+discarded rather than queued when the link is closed. Run the suites separately
+with
 `--suite reliability`, `--suite safety` or `--suite autonomy`.
 
 ---
@@ -329,7 +375,10 @@ to confirm the parity actually repairs them. Run the suites separately with
 | Camera not detected | `bash tools/verify-camera.sh`; check enable GPIO in `CLAUDE.md` |
 | `Device or resource busy` on `/dev/ttyAMA0` | `radcamd` holds it; stop the service first |
 | Payload silent on the bus | it is *supposed* to be silent until polled; send an LRT request |
-| Nothing comes back over HRT | DICE has not sent `HRT Go`; or use the LRT path instead |
+| Nothing comes back over HRT | DICE has not sent `HRT Go` — check `stream_gated` in telemetry |
+| Stream will not start | no hardware H.264 on a Pi 5; needs `ffmpeg` with libx264 present |
+| `stream_frames_dropped` climbing | normal under load — the link or encoder cannot keep up, so stale frames are discarded by design |
+| Video decodes as garbage | you started reading mid-stream; begin at a frame flagged as a keyframe |
 | Colours wrong, greys fine | something spectral, not gain — check for filters or tape over the sensor |
 | `safe_mode` set in telemetry | five commands failed in a row; check events, then `CLEAR_SAFE_MODE` |
 | Link works then stops | check `rx_bad_crc` and `rx_resyncs` in telemetry |
@@ -405,8 +454,10 @@ payload that has gone quiet is indistinguishable from a dead one.
 | `tools/stp-sim.py --port DEV --lrt` | poll telemetry and print it |
 | `tools/stp-sim.py --port DEV --capture` | take a picture |
 | `tools/stp-sim.py --port DEV --download ID` | fetch a file over HRT |
-| `tools/stp-sim.py --port DEV --lrt-download ID` | fetch a file over LRT |
-| `tools/stp-sim.py --fec-group N` | parity group size for an LRT download |
+| `tools/stp-sim.py --stream-start` / `--stream-stop` | start or stop live video |
+| `tools/stp-sim.py --stream-size WxH@FPS:KBPS` | e.g. `640x480@15:600` |
+| `tools/stp-sim.py --stream-region CX,CY,W,H` | crop centred on a sensor pixel |
+| `tools/stp-sim.py --watch-stream N --stream-out F` | receive live video for N s and save it |
 | `tools/stp-de-timing.py --throughput` | DE assertion timing and link throughput |
 | `tools/stp-crc-solve.py --bin FILE` | recover CRC parameters from captured traffic |
 | `tools/stp-crc-solve.py --demo` | prove the solver works |
@@ -441,10 +492,14 @@ Sent in the 105-byte command payload. Arguments are little-endian.
 | `0x71` | `ABORT_TRANSFERS` | — | empty the HRT queue |
 | `0x72` | `GET_LINK_STATS` | — | receive counters and resync counts |
 | `0x73` | `SET_HRT_IDLE_FILL` | enable `u8` | send idle HRT packets when nothing is queued |
-| `0x74` | `LRT_FILE_START` | media id `u32`, chunk size `u16`, FEC group `u16` | begin an LRT file transfer |
-| `0x75` | `LRT_FILE_STOP` | — | abandon the LRT transfer |
-| `0x76` | `LRT_FILE_RESEND` | media id `u32`, indices `u32…` | re-send LRT chunks (high bit = parity group) |
-| `0x77` | `SET_FEC_GROUP` | group size `u8` | parity group size; 0 disables correction |
+| `0x77` | `SET_FEC_GROUP` | group size `u8` | parity group size for HRT transfers; 0 disables |
+| `0x78` | `STREAM_START` | optionally w `u16`, h `u16`, fps `u8`, bitrate `u32`, then cx, cy, cw, ch `u16` | start live video |
+| `0x79` | `STREAM_STOP` | — | stop live video |
+| `0x7A` | `STREAM_SET_REGION` | centre_x, centre_y, crop_w, crop_h — all `u16` | aim the crop box at a sensor pixel |
+| `0x7B` | `STREAM_SET_OUTPUT` | width `u16`, height `u16`, fps `u8`, bitrate `u32` | stream resolution and rate |
+
+All four stream commands reply with the **effective** settings after clamping:
+width, height, fps, bitrate, centre_x, centre_y, crop_w, crop_h.
 
 ### Packet types on the wire
 
@@ -461,6 +516,19 @@ Sent in the 105-byte command payload. Arguments are little-endian.
 
 > Packet type alone never identifies a packet — `0x10`, `0x81` and `0x87` each
 > mean two different things. Direction and length together disambiguate.
+
+### HRT payload sub-types
+
+The first two bytes of every HRT payload say what it is.
+
+| Sub-type | Name | Meaning |
+|---|---|---|
+| `0x0000` | `IDLE` | filler, only when idle fill is enabled |
+| `0x0001` | `MEDIA_INFO` | file id, size, chunk count, whole-file CRC-32 |
+| `0x0002` | `MEDIA_DATA` | one numbered chunk of a file |
+| `0x0003` | `MEDIA_END` | file finished, with its CRC-32 |
+| `0x0004` | `MEDIA_PARITY` | XOR parity for the group named by `chunk_index` |
+| `0x0005` | `STREAM_DATA` | one chunk of a live video frame |
 
 ### Error codes
 

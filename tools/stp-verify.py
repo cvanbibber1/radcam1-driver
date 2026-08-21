@@ -34,7 +34,6 @@ from radcam.stp.experiment import Experiment, ExperimentConfig, StpOp     # noqa
 from radcam.stp.link import Rs422Link, NullDeLine                         # noqa: E402
 from radcam.stp.redundancy import Scrubber, TMRBool, TMRInt, TMRUnrecoverable  # noqa: E402
 from radcam.stp import fec                                            # noqa: E402
-from radcam.stp.lrtfile import PARITY_REQUEST_BIT                     # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)) + "/..")
 from tests.support import FakeMediaStore, MemoryLink, drain_experiment    # noqa: E402
@@ -59,6 +58,69 @@ class Checker:
 
     def section(self, title: str) -> None:
         print(f"\n--- {title} ---")
+
+
+class _FakeStream:
+    """A stream with no camera, so the protocol path is checkable anywhere."""
+
+    def __init__(self):
+        from radcam.stream import StreamConfig
+        self.config = StreamConfig()
+        self.running = False
+        self.fault = None
+        self.frames = []
+        self.frames_encoded = 1
+        self.frames_dropped = 0
+        self.frames_taken = 0
+        self.bytes_encoded = 0
+
+    def start(self, config=None):
+        if config is not None:
+            self.config = config.sanitised()
+        self.running = True
+        return True
+
+    def stop(self):
+        was, self.running = self.running, False
+        return was
+
+    def take(self):
+        return self.frames.pop(0) if self.frames else None
+
+    def flush(self, keep_keyframe=False):
+        dropped = len(self.frames)
+        self.frames.clear()
+        self.frames_dropped += dropped
+        return dropped
+
+    def encoder_late(self):
+        return False
+
+    @property
+    def queue_depth(self):
+        return len(self.frames)
+
+    def status(self):
+        cfg = self.config
+        return {"stream_width": cfg.width, "stream_height": cfg.height,
+                "stream_fps": cfg.fps, "stream_bitrate": cfg.bitrate,
+                "stream_centre_x": cfg.centre_x, "stream_centre_y": cfg.centre_y,
+                "stream_crop_w": cfg.crop_w, "stream_crop_h": cfg.crop_h,
+                "stream_frames_sent": self.frames_taken,
+                "stream_frames_dropped": self.frames_dropped,
+                "stream_bytes_sent": self.bytes_encoded,
+                "stream_queue_depth": len(self.frames)}
+
+
+def _frame(index, data, keyframe=False):
+    from radcam.stream import EncodedFrame
+    return EncodedFrame(index, data, keyframe, time.time())
+
+
+def _hrt(link) -> list:
+    raw = link.dice_read()
+    return [H.decode_hrt_payload(raw[i * 1288:(i + 1) * 1288][6:6 + 1280])
+            for i in range(len(raw) // 1288)]
 
 
 def _raises(fn) -> bool:
@@ -118,43 +180,6 @@ def poll_lrt(link, experiment):
         if kind == "LRT":
             return L.decode_lrt_payload(raw[6:6 + 1248])
     return None
-
-
-def stream_lrt_file(link, experiment, media_id, drop_every=0, limit=400):
-    """Pull a file down the LRT path, optionally dropping replies.
-
-    Returns (data chunks, parity chunks, final block). Dropping a reply models
-    an LRT packet lost in transit, which is what the parity chunks exist for.
-    """
-    command(link, StpOp.LRT_FILE_START, struct.pack("<I", media_id), seq=7000)
-    drain_experiment(experiment, passes=3)
-    link.dice_read()
-
-    data, parity, final, seen = {}, {}, None, 0
-    for _ in range(limit):
-        link.dice_read()
-        short(link, P.PacketType.LRT_REQUEST)
-        experiment.service()
-        raw = link.dice_read()
-        at = raw.find(WIRE.sync_bytes)
-        if at < 0:
-            continue
-        report = L.decode_lrt_payload(raw[at + 6:at + 6 + 1248])
-        if report["file_state"] == L.FILE_COMPLETE:
-            final = report
-            break
-        if report["file_state"] != L.FILE_ACTIVE:
-            continue
-        seen += 1
-        if drop_every and seen % drop_every == 0:
-            continue
-        if not report["file_data_crc_ok"]:
-            continue
-        if report["file_is_parity"]:
-            parity[report["file_chunk_index"]] = report["file_data"]
-        else:
-            data[report["file_chunk_index"]] = report["file_data"]
-    return data, parity, final
 
 
 # ---------------------------------------------------------------- reliability
@@ -309,60 +334,51 @@ def suite_reliability(c: Checker) -> None:
             _raises(lambda: fec.parity_of([b"x" * (size + 1)], size)))
     c.check("group size 0 emits no parity", fec.group_count(1000, 0) == 0)
 
-    c.section("LRT file transfer under loss")
-    link, store, exp = build(fec_group_size=8)
-    data, parity, final = stream_lrt_file(link, exp, 3, drop_every=11)
-    c.check("transfer reached completion", final is not None)
-    if final:
-        total = final["file_chunk_total"]
-        lost = [i for i in range(total) if i not in data]
-        c.check("replies were genuinely dropped", bool(lost),
-                f"{len(lost)} chunks lost in transit")
-        stats = fec.FecStats()
-        missing = fec.verify_and_repair(data, parity, total, 8,
-                                        L.FILE_DATA_MAX, stats)
-        c.check("parity repaired the losses with no retransmission",
-                not missing and stats.recovered > 0,
-                f"recovered {stats.recovered}, still missing {len(missing)}")
-        rebuilt = b"".join(data[i] for i in range(total))[:final["file_size"]]
-        c.check("the repaired file is bit-exact", rebuilt == store.blobs[3])
-        c.check("its CRC-32 matches what was advertised",
-                (zlib.crc32(rebuilt) & 0xFFFFFFFF) == final["file_crc32"])
-    exp.stop()
-
-    c.section("LRT resend covers what parity cannot")
-    link, store, exp = build(fec_group_size=4)
-    data, parity, final = stream_lrt_file(link, exp, 1)
-    total = final["file_chunk_total"]
-    forced = [0, 1]                      # two in one group: beyond parity
-    for i in forced:
-        data.pop(i, None)
-    missing = fec.verify_and_repair(data, parity, total, 4, L.FILE_DATA_MAX)
-    c.check("two losses in one group are correctly unrecoverable",
-            sorted(missing) == forced, str(missing))
-    command(link, StpOp.LRT_FILE_RESEND,
-            struct.pack("<I", 1) + b"".join(struct.pack("<I", i) for i in missing),
-            seq=7100)
-    drain_experiment(exp, passes=3)
-    link.dice_read()
-    for _ in range(6):
-        link.dice_read()
-        short(link, P.PacketType.LRT_REQUEST)
-        exp.service()
-        raw = link.dice_read()
-        at = raw.find(WIRE.sync_bytes)
-        if at < 0:
+    c.section("HRT transfer under loss, repaired by parity")
+    manager = H.TransferManager(group_size=8)
+    blob = os.urandom(H.HRT_CHUNK_DATA * 40 + 77)
+    manager.enqueue(1, blob)
+    data, parity, lengths, total = {}, {}, {}, 0
+    seen = 0
+    while True:
+        payload = manager.next_payload()
+        if payload is None:
+            break
+        decoded = H.decode_hrt_payload(payload)
+        if decoded["sub_type"] == H.SubType.MEDIA_INFO:
+            total = H.decode_media_info(decoded["data"])["chunk_total"]
             continue
-        report = L.decode_lrt_payload(raw[at + 6:at + 6 + 1248])
-        if report["file_state"] == L.FILE_ACTIVE and not report["file_is_parity"] \
-                and report["file_data_crc_ok"]:
-            data[report["file_chunk_index"]] = report["file_data"]
-    c.check("resend delivered the unrecoverable chunks",
-            all(i in data for i in forced))
-    rebuilt = b"".join(data[i] for i in range(total))[:final["file_size"]]
-    c.check("file is bit-exact after parity plus resend",
-            rebuilt == store.blobs[1])
-    exp.stop()
+        if decoded["sub_type"] == H.SubType.MEDIA_PARITY:
+            parity[decoded["chunk_index"]] = decoded["data"]
+            continue
+        if decoded["sub_type"] != H.SubType.MEDIA_DATA:
+            continue
+        seen += 1
+        lengths[decoded["chunk_index"]] = decoded["data_len"]
+        if seen % 11 == 0:              # a chunk lost in transit
+            continue
+        data[decoded["chunk_index"]] = decoded["data"]
+
+    lost = [i for i in range(total) if i not in data]
+    c.check("chunks were genuinely lost", bool(lost), f"{len(lost)} lost")
+    stats = fec.FecStats()
+    missing = fec.verify_and_repair(data, parity, total, 8,
+                                    H.HRT_CHUNK_DATA, stats)
+    c.check("parity repaired them with no retransmission",
+            not missing and stats.recovered > 0,
+            f"recovered {stats.recovered}, still missing {len(missing)}")
+    if not missing:
+        rebuilt = b"".join(data[i][:lengths[i]] for i in range(total))
+        c.check("the repaired file is bit-exact", rebuilt == blob)
+        c.check("its CRC-32 matches the original",
+                (zlib.crc32(rebuilt) & 0xFFFFFFFF)
+                == (zlib.crc32(blob) & 0xFFFFFFFF))
+
+    c.section("Losses beyond parity are reported, not silently wrong")
+    two_lost = {k: v for k, v in data.items() if k not in (0, 1)}
+    still = fec.verify_and_repair(two_lost, parity, total, 8, H.HRT_CHUNK_DATA)
+    c.check("two losses in one group remain unrecoverable",
+            sorted(still) == [0, 1], str(still))
 
     c.section("Payload builders never raise on bad state")
     ok = True
@@ -566,11 +582,12 @@ def suite_autonomy(c: Checker) -> None:
         ("link statistics", StpOp.GET_LINK_STATS, b""),
         ("abort transfers", StpOp.ABORT_TRANSFERS, b""),
         ("clear safe mode", StpOp.CLEAR_SAFE_MODE, b""),
-        ("start LRT file transfer", StpOp.LRT_FILE_START, struct.pack("<I", 1)),
-        ("resend LRT chunks", StpOp.LRT_FILE_RESEND, struct.pack("<II", 1, 0)),
-        ("stop LRT file transfer", StpOp.LRT_FILE_STOP, b""),
         ("set FEC group size", StpOp.SET_FEC_GROUP, bytes([16])),
         ("set HRT idle fill", StpOp.SET_HRT_IDLE_FILL, bytes([0])),
+        ("set stream output", StpOp.STREAM_SET_OUTPUT,
+         struct.pack("<HHBI", 640, 480, 15, 600_000)),
+        ("set stream region", StpOp.STREAM_SET_REGION,
+         struct.pack("<4H", 2104, 1560, 640, 480)),
     ]
     unreachable = []
     for seq, (name, opcode, args) in enumerate(functions, start=200):
@@ -582,18 +599,57 @@ def suite_autonomy(c: Checker) -> None:
             not unreachable, ", ".join(unreachable) if unreachable else "")
     exp.stop()
 
-    c.section("A file can be downlinked without HRT ever being opened")
+    c.section("Live video is gated by HRT and never queues")
     link, store, exp = build()
-    data, parity, final = stream_lrt_file(link, exp, 1)
-    c.check("HRT was never enabled during the transfer",
-            not exp._hrt_enabled.value())
-    c.check("the file still arrived in full", final is not None
-            and len(data) == final["file_chunk_total"],
-            f"{len(data)}/{final['file_chunk_total'] if final else '?'} chunks")
-    if final:
-        rebuilt = b"".join(data[i] for i in range(final["file_chunk_total"]))
-        c.check("and is bit-exact",
-                rebuilt[:final["file_size"]] == store.blobs[1])
+    exp.stream = _FakeStream()
+    command(link, StpOp.STREAM_START, seq=6000)
+    drain_experiment(exp, passes=3)
+    link.dice_read()
+
+    exp.stream.frames = [_frame(0, b"K" * 4000, True), _frame(1, b"P" * 900)]
+    for _ in range(4):
+        exp.service()
+    c.check("nothing streamed while HRT is closed", len(link.dice_read()) == 0)
+    c.check("and the queued frames were discarded, not held",
+            exp.stream.queue_depth == 0, f"{exp.stream.queue_depth} held")
+
+    exp.stream.frames = [_frame(2, b"K" * 4000, True)]
+    short(link, P.PacketType.HRT_GO)
+    exp.service()
+    packets = _hrt(link)
+    c.check("frames flow once HRT opens", bool(packets), f"{len(packets)} packets")
+    if packets:
+        c.check("every stream chunk carries a valid CRC-32",
+                all(p["data_crc_ok"] for p in packets))
+        c.check("chunk_total is correct on every chunk including the last",
+                len({p["chunk_total"] for p in packets}) == 1
+                and packets[-1]["last_chunk"])
+        c.check("keyframes are flagged so a receiver can join mid-stream",
+                packets[0]["keyframe"])
+        joined = b"".join(p["data"] for p in sorted(
+            packets, key=lambda p: p["chunk_index"]))
+        c.check("the frame reassembles bit-exact", joined == b"K" * 4000)
+    exp.stop()
+
+    c.section("Stream settings are clamped and echoed")
+    link, store, exp = build()
+    exp.stream = _FakeStream()
+    command(link, StpOp.STREAM_SET_REGION, struct.pack("<4H", 5, 5, 1024, 1024),
+            seq=6100)
+    report = poll_lrt(link, exp)
+    c.check("a region off the sensor edge is clamped",
+            report["stream_centre_x"] == 512 and report["stream_centre_y"] == 512,
+            f"centre=({report['stream_centre_x']},{report['stream_centre_y']})")
+    command(link, StpOp.STREAM_SET_OUTPUT,
+            struct.pack("<HHBI", 65535, 0, 250, 99_000_000), seq=6101)
+    report = poll_lrt(link, exp)
+    c.check("absurd output settings are clamped, not obeyed",
+            report["stream_width"] <= 1920 and report["stream_fps"] <= 30
+            and report["stream_bitrate"] <= 8_000_000,
+            f"{report['stream_width']}x{report['stream_height']}@"
+            f"{report['stream_fps']} {report['stream_bitrate']}bps")
+    c.check("the applied values are visible in telemetry",
+            report["stream_width"] > 0)
     exp.stop()
 
     c.section("Camera commands report faults rather than hanging")

@@ -11,6 +11,13 @@ ground sent so a result can never be misattributed to the wrong command.
 Layout is big-endian throughout, matching the packet envelope, and every offset
 is a named constant so the ground decoder and this builder cannot drift.
 
+**LRT carries telemetry and vitals only.** Bulk data belongs to HRT: an
+earlier revision reserved 544 bytes here for a contingency file-transfer path,
+which cost the event ring more than half its entries and halved the
+command-response window. With the mission's confirmation that HRT is the
+transfer channel, that space is better spent on what this packet is actually
+for.
+
 Two things are deliberately redundant:
 
 * **The dose fields are triplicated in the payload itself.** The envelope CRC
@@ -39,9 +46,8 @@ log = logging.getLogger(__name__)
 __all__ = [
     "LRT_PAYLOAD_LEN", "LRT_FORMAT_VERSION", "EventLog", "Event", "EventCode",
     "build_lrt_payload", "decode_lrt_payload", "MAX_EVENTS",
-    "RESP_DATA_MAX", "FILE_DATA_MAX", "FILE_IDLE", "FILE_ACTIVE",
-    "FILE_COMPLETE", "FILE_ERROR", "FILE_FLAG_PARITY",
-    "FILE_FLAG_LAST_DATA", "FILE_FLAG_RETRANSMIT",
+    "RESP_DATA_MAX", "STREAM_OFF", "STREAM_STARTING", "STREAM_RUNNING",
+    "STREAM_FAULT", "STREAM_FLAG_GATED", "STREAM_FLAG_ENCODER_LATE",
 ]
 
 LRT_PAYLOAD_LEN = 1248
@@ -133,49 +139,45 @@ OFF_RESP_LEN = 201
 #: A non-zero value means the complete reply was also queued for HRT.
 OFF_RESP_FULL_LEN = 203
 OFF_RESP_DATA = 205
-RESP_DATA_MAX = 256
+RESP_DATA_MAX = 512
 
-# ---- LRT file transfer block ----------------------------------------------
-# HRT is the fast path for bulk data, but it only flows when DICE opens the
-# tap. If the master never sends HRT Go - because HRT is allocated to another
-# experiment, or the schedule does not permit it - then without this block
-# there is no way to get an image down at all. LRT is the one channel that is
-# always polled, so a file can also be pulled through it, one chunk per poll:
-# far slower, but never blocked on somebody else's permission.
-#
-# It is a *separate* block rather than a reuse of the response window so that a
-# transfer in progress and a command reply can occupy the same LRT packet. If
-# they shared the window, every command issued mid-transfer would stall it.
-OFF_FILE_STATE = 461
-OFF_FILE_FLAGS = 463
-OFF_FILE_MEDIA_ID = 465
-OFF_FILE_CHUNK_INDEX = 469
-OFF_FILE_CHUNK_TOTAL = 473
-OFF_FILE_SIZE = 477
-OFF_FILE_CRC32 = 481
-OFF_FILE_DATA_LEN = 485
-OFF_FILE_FEC_GROUP = 487
-OFF_FILE_DATA_CRC32 = 489
-OFF_FILE_DATA = 493
-FILE_DATA_MAX = 512
-FILE_HEADER_LEN = OFF_FILE_DATA - OFF_FILE_STATE                 # 32
+# ---- live video stream state ----------------------------------------------
+# The stream itself goes out over HRT; what belongs here is the ground's view
+# of it. Frames dropped is the number that matters: a livestream on a
+# flow-controlled link must discard stale frames rather than queue them, so a
+# rising drop count is normal operation under load, not a fault - but a drop
+# count rising faster than frames sent means the settings are beyond what the
+# link or the encoder can carry.
+OFF_STREAM_STATE = 717
+OFF_STREAM_FLAGS = 718
+OFF_STREAM_WIDTH = 719
+OFF_STREAM_HEIGHT = 721
+OFF_STREAM_FPS = 723
+OFF_STREAM_BITRATE = 724
+OFF_STREAM_CENTRE_X = 728
+OFF_STREAM_CENTRE_Y = 730
+OFF_STREAM_CROP_W = 732
+OFF_STREAM_CROP_H = 734
+OFF_STREAM_FRAMES_SENT = 736
+OFF_STREAM_FRAMES_DROPPED = 740
+OFF_STREAM_BYTES_SENT = 744
+OFF_STREAM_QUEUE_DEPTH = 752
+OFF_FEC_GROUP = 754
 
-#: LRT file transfer states, reported in OFF_FILE_STATE.
-FILE_IDLE, FILE_ACTIVE, FILE_COMPLETE, FILE_ERROR = 0, 1, 2, 3
+#: Live stream states, reported in OFF_STREAM_STATE.
+STREAM_OFF, STREAM_STARTING, STREAM_RUNNING, STREAM_FAULT = 0, 1, 2, 3
 
-#: This chunk is XOR parity for the group named by chunk_index, not file data.
-FILE_FLAG_PARITY = 0x0001
-#: This is the last *data* chunk of the file.
-FILE_FLAG_LAST_DATA = 0x0002
-#: This chunk is being sent again after an explicit resend request.
-FILE_FLAG_RETRANSMIT = 0x0004
+#: The stream is running but HRT is closed, so frames are being discarded.
+STREAM_FLAG_GATED = 0x01
+#: The encoder is not keeping up with the configured frame rate.
+STREAM_FLAG_ENCODER_LATE = 0x02
 
 # ---- event ring -----------------------------------------------------------
-OFF_EVENT_COUNT = OFF_FILE_DATA + FILE_DATA_MAX                  # 1005
-OFF_EVENTS = OFF_EVENT_COUNT + 2                                 # 1007
+OFF_EVENT_COUNT = 756
+OFF_EVENTS = OFF_EVENT_COUNT + 2                                 # 758
 EVENT_SIZE = 12
 OFF_PAYLOAD_CRC32 = 1244
-MAX_EVENTS = (OFF_PAYLOAD_CRC32 - OFF_EVENTS) // EVENT_SIZE      # 19
+MAX_EVENTS = (OFF_PAYLOAD_CRC32 - OFF_EVENTS) // EVENT_SIZE      # 40
 
 #: Transfer states reported in OFF_XFER_STATE.
 XFER_IDLE, XFER_ACTIVE, XFER_PAUSED, XFER_COMPLETE = 0, 1, 2, 3
@@ -367,22 +369,25 @@ def build_lrt_payload(state: dict, events: list[Event] | None = None) -> bytes:
                len(resp) & 0xFFFF if len(resp) > RESP_DATA_MAX else 0)
     buf[OFF_RESP_DATA:OFF_RESP_DATA + len(fitted)] = fitted
 
-    chunk = g("file_data", b"") or b""
-    _pack_into(buf, OFF_FILE_STATE, "H", int(g("file_state", FILE_IDLE)) & 0xFFFF)
-    _pack_into(buf, OFF_FILE_FLAGS, "H", int(g("file_flags", 0)) & 0xFFFF)
-    _pack_into(buf, OFF_FILE_MEDIA_ID, "I", int(g("file_media_id", 0)) & 0xFFFFFFFF)
-    _pack_into(buf, OFF_FILE_CHUNK_INDEX, "I",
-               int(g("file_chunk_index", 0)) & 0xFFFFFFFF)
-    _pack_into(buf, OFF_FILE_CHUNK_TOTAL, "I",
-               int(g("file_chunk_total", 0)) & 0xFFFFFFFF)
-    _pack_into(buf, OFF_FILE_SIZE, "I", int(g("file_size", 0)) & 0xFFFFFFFF)
-    _pack_into(buf, OFF_FILE_CRC32, "I", int(g("file_crc32", 0)) & 0xFFFFFFFF)
-    fitted_chunk = chunk[:FILE_DATA_MAX]
-    _pack_into(buf, OFF_FILE_DATA_LEN, "H", len(fitted_chunk))
-    _pack_into(buf, OFF_FILE_FEC_GROUP, "H", int(g("file_fec_group", 0)) & 0xFFFF)
-    _pack_into(buf, OFF_FILE_DATA_CRC32, "I",
-               zlib.crc32(fitted_chunk) & 0xFFFFFFFF)
-    buf[OFF_FILE_DATA:OFF_FILE_DATA + len(fitted_chunk)] = fitted_chunk
+    buf[OFF_STREAM_STATE] = int(g("stream_state", STREAM_OFF)) & 0xFF
+    buf[OFF_STREAM_FLAGS] = int(g("stream_flags", 0)) & 0xFF
+    _pack_into(buf, OFF_STREAM_WIDTH, "H", int(g("stream_width", 0)) & 0xFFFF)
+    _pack_into(buf, OFF_STREAM_HEIGHT, "H", int(g("stream_height", 0)) & 0xFFFF)
+    buf[OFF_STREAM_FPS] = int(g("stream_fps", 0)) & 0xFF
+    _pack_into(buf, OFF_STREAM_BITRATE, "I", int(g("stream_bitrate", 0)) & 0xFFFFFFFF)
+    _pack_into(buf, OFF_STREAM_CENTRE_X, "H", int(g("stream_centre_x", 0)) & 0xFFFF)
+    _pack_into(buf, OFF_STREAM_CENTRE_Y, "H", int(g("stream_centre_y", 0)) & 0xFFFF)
+    _pack_into(buf, OFF_STREAM_CROP_W, "H", int(g("stream_crop_w", 0)) & 0xFFFF)
+    _pack_into(buf, OFF_STREAM_CROP_H, "H", int(g("stream_crop_h", 0)) & 0xFFFF)
+    _pack_into(buf, OFF_STREAM_FRAMES_SENT, "I",
+               int(g("stream_frames_sent", 0)) & 0xFFFFFFFF)
+    _pack_into(buf, OFF_STREAM_FRAMES_DROPPED, "I",
+               int(g("stream_frames_dropped", 0)) & 0xFFFFFFFF)
+    _pack_into(buf, OFF_STREAM_BYTES_SENT, "Q",
+               int(g("stream_bytes_sent", 0)) & (2**64 - 1))
+    _pack_into(buf, OFF_STREAM_QUEUE_DEPTH, "H",
+               int(g("stream_queue_depth", 0)) & 0xFFFF)
+    buf[OFF_FEC_GROUP] = int(g("fec_group_size", 0)) & 0xFF
 
     events = events or []
     n = min(len(events), MAX_EVENTS)
@@ -478,27 +483,25 @@ def decode_lrt_payload(payload: bytes) -> dict:
     #: True when the reply was too big for LRT and also went out over HRT.
     out["resp_truncated"] = out["resp_full_len"] > 0
 
-    file_len = min(u("H", OFF_FILE_DATA_LEN), FILE_DATA_MAX)
-    file_data = payload[OFF_FILE_DATA:OFF_FILE_DATA + file_len]
-    file_flags = u("H", OFF_FILE_FLAGS)
+    stream_flags = payload[OFF_STREAM_FLAGS]
     out.update({
-        "file_state": u("H", OFF_FILE_STATE),
-        "file_flags": file_flags,
-        "file_media_id": u("I", OFF_FILE_MEDIA_ID),
-        "file_chunk_index": u("I", OFF_FILE_CHUNK_INDEX),
-        "file_chunk_total": u("I", OFF_FILE_CHUNK_TOTAL),
-        "file_size": u("I", OFF_FILE_SIZE),
-        "file_crc32": u("I", OFF_FILE_CRC32),
-        "file_fec_group": u("H", OFF_FILE_FEC_GROUP),
-        "file_data": file_data,
-        "file_data_crc32": u("I", OFF_FILE_DATA_CRC32),
-        # Reported, never enforced: a chunk failing this is exactly what the
-        # parity groups exist to reconstruct.
-        "file_data_crc_ok": (zlib.crc32(file_data) & 0xFFFFFFFF)
-                            == u("I", OFF_FILE_DATA_CRC32),
-        "file_is_parity": bool(file_flags & FILE_FLAG_PARITY),
-        "file_last_data": bool(file_flags & FILE_FLAG_LAST_DATA),
-        "file_retransmit": bool(file_flags & FILE_FLAG_RETRANSMIT),
+        "stream_state": payload[OFF_STREAM_STATE],
+        "stream_flags": stream_flags,
+        "stream_width": u("H", OFF_STREAM_WIDTH),
+        "stream_height": u("H", OFF_STREAM_HEIGHT),
+        "stream_fps": payload[OFF_STREAM_FPS],
+        "stream_bitrate": u("I", OFF_STREAM_BITRATE),
+        "stream_centre_x": u("H", OFF_STREAM_CENTRE_X),
+        "stream_centre_y": u("H", OFF_STREAM_CENTRE_Y),
+        "stream_crop_w": u("H", OFF_STREAM_CROP_W),
+        "stream_crop_h": u("H", OFF_STREAM_CROP_H),
+        "stream_frames_sent": u("I", OFF_STREAM_FRAMES_SENT),
+        "stream_frames_dropped": u("I", OFF_STREAM_FRAMES_DROPPED),
+        "stream_bytes_sent": u("Q", OFF_STREAM_BYTES_SENT),
+        "stream_queue_depth": u("H", OFF_STREAM_QUEUE_DEPTH),
+        "stream_gated": bool(stream_flags & STREAM_FLAG_GATED),
+        "stream_encoder_late": bool(stream_flags & STREAM_FLAG_ENCODER_LATE),
+        "fec_group_size": payload[OFF_FEC_GROUP],
     })
 
     for offset, key in ((OFF_RX_GOOD, "rx_good"),

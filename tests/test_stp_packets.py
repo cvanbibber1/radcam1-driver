@@ -110,6 +110,35 @@ class TestPacketSizes(unittest.TestCase):
         stored = self.wire.crc.unpack(packet[12:14])
         self.assertEqual(self.wire.crc.compute(packet[4:12]), stored)
 
+    def test_crc_is_always_the_final_two_bytes(self):
+        """Mission-confirmed rule: the last two bytes of every message are CRC.
+
+        This was an inference for LRT Data, whose supplied ICD rows accounted
+        for only 1254 of its 1256 bytes. It is now a stated rule, so it is
+        asserted here for every message this implementation emits rather than
+        left implicit in six separate offset constants.
+        """
+        messages = [
+            ("Command", P.encode_command(b"x" * 105, 1, 2, self.wire, 0xC7)),
+            ("Command ACK", P.encode_command_ack(self.wire, 0xC7)),
+            ("LRT Request", P.encode_short_request(
+                P.PacketType.LRT_REQUEST, 1, 2, self.wire, 0xC7)),
+            ("HRT Go", P.encode_short_request(
+                P.PacketType.HRT_GO, 1, 2, self.wire, 0xC7)),
+            ("LRT Data", P.encode_lrt_data(b"y" * 1248, self.wire, 0xC7)),
+            ("HRT Data", P.encode_hrt_data(b"z" * 1280, self.wire, 0xC7)),
+        ]
+        for name, packet in messages:
+            with self.subTest(name):
+                stored = self.wire.crc.unpack(packet[-2:])
+                computed = self.wire.crc.compute(packet[4:-2])
+                self.assertEqual(computed, stored,
+                                 f"{name}: CRC is not the final two bytes")
+
+    def test_assigned_target_id_is_the_default(self):
+        """0xC7 is this experiment's mission-assigned address, not a placeholder."""
+        self.assertEqual(P.Wire().target_id, 0xC7)
+
     def test_lrt_trailer_can_be_zeros_instead_of_crc(self):
         zeroed = P.Wire(target_id=1, lrt_trailer="zero")
         packet = P.encode_lrt_data(b"x" * 1248, zeroed, 1)
