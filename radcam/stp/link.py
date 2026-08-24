@@ -129,18 +129,50 @@ class DeLine:
 
 
 class NullDeLine(DeLine):
-    """Stand-in for boards where DE is not software-controlled.
+    """For boards where DE is not software-controlled.
 
-    Only safe when this experiment is the sole transmitter on the bus, or the
-    transceiver does its own direction control.
+    Two situations need this, and they are not the same:
+
+    * The transceiver does its own direction control, and the pin is unused.
+    * **DE is tied active by a hardware pull-up**, which is the right design
+      when the payload is the only transmitter on the bus. Here software must
+      not merely refrain from asserting DE - it must stop *driving the pin at
+      all*, because a push-pull output parked low overrides a pull-up and holds
+      the transmitter disabled. Pass `release_gpio` and the pin is turned back
+      into an input at open, handing control to the hardware.
+
+    That second case is easy to get wrong and hard to see: the link looks
+    plausible, DE toggles in a logic capture, and packets still do not arrive,
+    because the driver is only enabled for the few microseconds around each
+    transmission and an isolated transceiver may not switch that fast.
     """
 
-    def __init__(self):
-        super().__init__(gpio=-1)
+    def __init__(self, release_gpio: int | None = None,
+                 chip: str = DEFAULT_CHIP):
+        super().__init__(gpio=-1 if release_gpio is None else release_gpio,
+                         chip=chip)
+        self.release_gpio = release_gpio
 
     def open(self) -> None:
-        log.warning("DE is not software-controlled; this is only safe if "
-                    "nothing else transmits on the bus")
+        if self.release_gpio is None:
+            log.warning("DE is not software-controlled; this is only safe if "
+                        "nothing else transmits on the bus")
+            return
+
+        # Turn the pin into an input so the board's pull-up decides the level.
+        # gpiod would hand it back on release anyway, but only after we had
+        # driven it - and the point is never to drive it.
+        try:
+            import subprocess
+            subprocess.run(["pinctrl", "set", str(self.release_gpio), "ip", "pu"],
+                           check=False, capture_output=True, timeout=5)
+            state = subprocess.run(["pinctrl", "get", str(self.release_gpio)],
+                                   capture_output=True, text=True, timeout=5)
+            log.info("DE on GPIO%d released to the hardware pull-up: %s",
+                     self.release_gpio, state.stdout.strip())
+        except Exception as exc:                       # noqa: BLE001
+            log.warning("could not release DE GPIO%d: %s",
+                        self.release_gpio, exc)
 
     def set(self, enabled: bool) -> None:
         return

@@ -253,10 +253,16 @@ class Daemon:
         )
 
         de_gpio = cfg.get("de_gpio", 4)
-        de = NullDeLine() if de_gpio in (None, -1) else DeLine(
-            gpio=int(de_gpio),
-            chip=str(cfg.get("de_chip", "/dev/gpiochip0")),
-            active_high=bool(cfg.get("de_active_high", True)))
+        chip = str(cfg.get("de_chip", "/dev/gpiochip0"))
+        if de_gpio in (None, -1):
+            de = NullDeLine(chip=chip)
+        elif not cfg.get("de_control", True):
+            # DE is tied active in hardware. Release the pin rather than
+            # parking it low, which would hold the transmitter disabled.
+            de = NullDeLine(release_gpio=int(de_gpio), chip=chip)
+        else:
+            de = DeLine(gpio=int(de_gpio), chip=chip,
+                        active_high=bool(cfg.get("de_active_high", True)))
 
         self.stp_link = Rs422Link(
             port=str(cfg.get("port", self.cfg.get("flight_port", FLIGHT_PORT))),
