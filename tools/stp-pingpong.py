@@ -454,6 +454,69 @@ def tx_sweep(args) -> int:
     return 0
 
 
+def dc_test(args) -> int:
+    """Swing the line's DC balance so hard that framing stops mattering.
+
+    Every test so far has asked whether bytes decode. That question is useless
+    when a receiver is picking up noise on a floating pair: it reports 95% 0xFF
+    whatever happens, because an idle-mark line glitched by noise fakes a start
+    bit and reads the rest of the character as ones.
+
+    So stop asking about bytes. At 9600 baud a continuous stream of 0x00 holds
+    the line LOW for nine bit times out of every ten - 937 us low, 104 us high,
+    roughly 90% duty. No receiver anywhere, at any baud, correctly framed or
+    not, reports 0xFF while looking at a line held low 90% of the time.
+
+    This alternates that against a genuinely idle line on a slow cycle. Watch
+    the far end's byte statistics:
+
+      * ratio swings between mostly-0x00 and mostly-0xFF in step  -> CONNECTED
+      * stays ~95% 0xFF throughout                                -> NOT connected
+
+    That distinction survives wrong baud, wrong polarity and total framing
+    failure, which is exactly what is needed when nothing else has.
+    """
+    handle = serial.Serial(args.port, args.dc_baud, timeout=0.05)
+    period = args.dwell
+    block = b"\x00" * 256
+
+    print(f"\nDC balance test on {args.port} at {args.dc_baud} baud.")
+    print(f"  {period:.0f} s driving the line ~90% LOW, then "
+          f"{period:.0f} s idle HIGH, repeating.\n")
+    print("  Watch the far end's byte histogram, not its text:")
+    print("    swings between mostly 0x00 and mostly 0xFF  ->  pair IS connected")
+    print("    stays ~95% 0xFF regardless                  ->  pair is NOT connected")
+    print()
+    print("  This works even if the baud is wrong and the framing never")
+    print("  succeeds, because it changes how long the line spends low.\n")
+
+    cycle = 0
+    start = time.time()
+    try:
+        while args.seconds <= 0 or time.time() - start < args.seconds:
+            cycle += 1
+
+            end = time.time() + period
+            sent = 0
+            while time.time() < end:
+                handle.write(block)
+                sent += len(block)
+            handle.flush()
+            print(f"  cycle {cycle:3d}  LOW  {period:.0f}s  "
+                  f"({sent} zero bytes, line ~90% low)", flush=True)
+
+            end = time.time() + period
+            while time.time() < end:
+                time.sleep(0.05)
+            print(f"  cycle {cycle:3d}  IDLE {period:.0f}s  "
+                  f"(nothing sent, line high)", flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        handle.close()
+    return 0
+
+
 def stp_ping(args) -> int:
     """The same idea, but as real protocol packets."""
     handle = open_port(args)
@@ -521,6 +584,10 @@ def main() -> int:
                       help="transmit continuously and decode anything received")
     mode.add_argument("--tx-sweep", action="store_true",
                       help="transmit at each baud rate in turn, slowest last")
+    mode.add_argument("--dc-test", action="store_true",
+                      help="alternate line-low and line-idle; framing-independent")
+    ap.add_argument("--dc-baud", type=int, default=9600,
+                    help="slow rate for --dc-test; low = longer low periods")
     ap.add_argument("--dwell", type=float, default=10.0,
                     help="seconds at each rate in --tx-sweep")
     ap.add_argument("--pattern", default="55",
@@ -547,6 +614,8 @@ def main() -> int:
         return pingpong(args)
     if args.tx_sweep:
         return tx_sweep(args)
+    if args.dc_test:
+        return dc_test(args)
     return stp_ping(args)
 
 
