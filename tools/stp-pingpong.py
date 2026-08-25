@@ -517,6 +517,73 @@ def dc_test(args) -> int:
     return 0
 
 
+def polarity_test(args) -> int:
+    """Decide whether a pair is inverted, from the far end's byte histogram.
+
+    The two patterns below sit at opposite ends of the line's duty cycle, so
+    what the far end reports identifies the polarity without it needing to
+    frame anything correctly.
+
+    At 9600 baud, back to back:
+
+      0x00 -> start bit plus eight zero bits = 9 bit times LOW, then a 1 bit
+              stop HIGH. The line is low ~90% of the time.
+      0xFF -> start bit LOW for 1 bit time, then eight high bits and a high
+              stop. The line is high ~90% of the time.
+
+    Correct polarity, the far end sees:  0x00 phase -> 0x00 or BREAK
+                                         0xFF phase -> 0xFF
+    Inverted polarity, it sees:          0x00 phase -> 0xFF
+                                         0xFF phase -> 0x00 or BREAK
+
+    The inverted case for the 0x00 phase is worth spelling out, because it is
+    counter-intuitive and it is what was observed here: our 938 us low becomes
+    the receiver's 938 us high, and our 104 us stop bit becomes its 104 us low
+    - exactly one bit time at 9600, so a textbook start bit followed by eight
+    high bits. One clean 0xFF per byte transmitted.
+
+    There is no software fix. Inverting the data bytes would not invert the
+    start and stop bits, so framing would still fail. The two wires of that
+    pair have to be swapped.
+    """
+    handle = serial.Serial(args.port, args.dc_baud, timeout=0.05)
+    period = args.dwell
+
+    print(f"\nPolarity test on {args.port} at {args.dc_baud} baud.\n")
+    print(f"  Phase A: {period:.0f} s of 0x00  - line ~90% LOW")
+    print(f"  Phase B: {period:.0f} s of 0xFF  - line ~90% HIGH")
+    print()
+    print("  Record what the far end reports in each phase:\n")
+    print("    A -> 0x00/BREAK   and  B -> 0xFF      polarity CORRECT")
+    print("    A -> 0xFF         and  B -> 0x00/BREAK   polarity INVERTED,")
+    print("                                             swap that pair's wires")
+    print("    both phases identical                    not connected, or the")
+    print("                                             far end sees only noise")
+    print()
+
+    cycle = 0
+    start = time.time()
+    try:
+        while args.seconds <= 0 or time.time() - start < args.seconds:
+            cycle += 1
+            for label, value, duty in (("A", 0x00, "~90% LOW"),
+                                       ("B", 0xFF, "~90% HIGH")):
+                block = bytes([value]) * 256
+                end = time.time() + period
+                sent = 0
+                while time.time() < end:
+                    handle.write(block)
+                    sent += len(block)
+                handle.flush()
+                print(f"  cycle {cycle:3d}  phase {label}  0x{value:02X} x{sent:6d}"
+                      f"   line {duty}", flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        handle.close()
+    return 0
+
+
 def stp_ping(args) -> int:
     """The same idea, but as real protocol packets."""
     handle = open_port(args)
@@ -586,6 +653,8 @@ def main() -> int:
                       help="transmit at each baud rate in turn, slowest last")
     mode.add_argument("--dc-test", action="store_true",
                       help="alternate line-low and line-idle; framing-independent")
+    mode.add_argument("--polarity", action="store_true",
+                      help="alternate 0x00 and 0xFF to detect an inverted pair")
     ap.add_argument("--dc-baud", type=int, default=9600,
                     help="slow rate for --dc-test; low = longer low periods")
     ap.add_argument("--dwell", type=float, default=10.0,
@@ -616,6 +685,8 @@ def main() -> int:
         return tx_sweep(args)
     if args.dc_test:
         return dc_test(args)
+    if args.polarity:
+        return polarity_test(args)
     return stp_ping(args)
 
 
