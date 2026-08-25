@@ -398,6 +398,7 @@ The keys that matter most:
 | `stp.target_id` | our address on the bus — **`199` (0xC7)** |
 | `stp.baud` | 921600 |
 | `stp.de_gpio` | driver enable pin, 4 on this board |
+| `stp.de_control` | **false when DE is tied active in hardware** — releases the pin instead of driving it |
 | `stp.big_endian` | `true` |
 | `stp.crc_variant` | `"CRC-16/CCITT-FALSE"` |
 | `stp.fec_group_size` | chunks per parity chunk on HRT transfers; 0 disables |
@@ -450,6 +451,9 @@ with
 | No free slots | download what you need, then `SLOT_DELETE` — deletion is what frees space |
 | Slot download refused with code 10 | the stored file failed its CRC-32; the bytes rotted, recapture |
 | A canned command runs only once | it was generated with `--no-force`; regenerate without that flag |
+| Link completely silent both ways | check DE wiring first — if the board ties DE active, set `"de_control": false` or software will hold the transmitter off |
+| Payload receives nothing, `fe=0` | no signal reaching GPIO15 at all; a baud mismatch or reversed pair gives framing errors, not silence |
+| Need to prove the link electrically | `tools/stp-pingpong.py --scope` transmits a continuous square wave to probe |
 | Colours wrong, greys fine | something spectral, not gain — check for filters or tape over the sensor |
 | `safe_mode` set in telemetry | five commands failed in a row; check events, then `CLEAR_SAFE_MODE` |
 | Link works then stops | check `rx_bad_crc` and `rx_resyncs` in telemetry |
@@ -550,6 +554,11 @@ SLOT_DELETE slot=0             # free the slot for next time
 | `tools/stp-command.py --verify` | prove every generated string is accepted |
 | `tools/stp-metrics.py` | link arithmetic, transfer times, stream budget |
 | `tools/stp-metrics.py --all` | plus measured UART and encoder performance |
+| `tools/stp-rxdiag.py --scan` | why is nothing arriving: silent, garbled, or wrong target |
+| `tools/stp-beacon.py --hrt` | transmit LRT/HRT unsolicited to test a host's receiver |
+| `tools/stp-pingpong.py --raw-ping` | plain ASCII any terminal can see |
+| `tools/stp-pingpong.py --loopback` | prove the payload's whole path with a jumper |
+| `tools/stp-pingpong.py --scope` | continuous pattern for oscilloscope probing |
 | `tools/stp-verify.py` | 85 reliability, safety and autonomy checks |
 | `tools/stp-verify.py --suite safety` | one suite only |
 

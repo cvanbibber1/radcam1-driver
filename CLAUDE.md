@@ -192,7 +192,7 @@ Config: `/etc/radcam/config.json`. Calibration: `/var/lib/radcam/dosimeter-cal.j
 | Dosimeter LTC2485 | GPIO2/3, `i2c-1`, **addr 0x24** | ✅ working (CA0/CA1 both floating) |
 | LED PWM | GPIO18 → PWM0_CHAN2, `pwmchip0` ch 2 | ✅ working, capped at 10% |
 | Flight RS422 | GPIO14/15 → uart0 → `/dev/ttyAMA0` | ✅ **STP/DICE at 921600, target 0xC7** |
-| RS422 driver enable | GPIO4 → ADM2582E DE | ✅ working, released ~30 µs after last stop bit |
+| RS422 driver enable | GPIO4 → ADM2582E DE | ⚠️ **this board ties DE active in hardware** — see below |
 | EXTUART mirror | GPIO24 TX / GPIO23 RX, **RP1 PIO** | ✅ working at **921600**, bidirectional |
 
 > GPIO23/24 expose no TXD/RXD on a Pi 5 — only SD0/DPI/I2S/**PIO**. Userspace
@@ -295,6 +295,25 @@ emitted as each group closes, so an interrupted transfer still leaves completed
 groups repairable. Beyond one loss per group, explicit RESEND takes over.
 Live video carries no parity — a late frame is worthless, and H.264 recovers at
 the next keyframe for free.
+
+### DE: check how the board wires it before trusting the software
+
+This board pulls **DE up** and **/RE down**, so the ADM2582E is meant to sit
+permanently enabled in full duplex with the payload as the only transmitter.
+Software driving GPIO4 low between packets **held the transmitter disabled**,
+because a push-pull output beats a pull-up.
+
+That failure is invisible from the payload: DE toggles, the UART counts every
+byte transmitted, and TEMT confirms the shift register emptied. None of that
+proves the differential driver was enabled in time for those bits to reach the
+wire.
+
+Set `"de_control": false` in the `stp` config when DE is tied active. The link
+then turns GPIO4 back into an **input** at startup rather than merely refraining
+from asserting it — refraining is not enough, the pin has to stop being driven.
+Confirm with `pinctrl get 4`, which should read `ip pu | hi`.
+
+Software DE timing below applies only when `de_control` is true.
 
 ### DE timing — measured, not assumed
 

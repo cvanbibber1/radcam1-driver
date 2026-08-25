@@ -66,6 +66,24 @@ commands are refused, but **LRT keeps answering**. A payload that has gone quiet
 is indistinguishable from a dead one, and the ground needs housekeeping most
 when things are going wrong. `StpOp.CLEAR_SAFE_MODE` (0x70) recovers it.
 
+## DE: a hardware question before it is a software one
+
+Before any of the timing below matters, establish how the board wires DE. This
+one does it in hardware — DE pulled up, /RE pulled down, permanently enabled in
+full duplex — and software driving GPIO4 low between packets held the
+transmitter off. A push-pull output overrides a pull-up.
+
+The failure is silent from this end. DE toggles, the UART counts the bytes, and
+TEMT says the shift register emptied; none of that observes the differential
+driver. What finally showed it was crosstalk: with DE parked low, transmitting
+produced no received bytes at all on an unconnected receive pair, and with DE
+released every transmit burst produced exactly one — our own driver switching,
+coupling in. A silent listen returned zero and a 2000-byte burst returned one,
+which distinguishes crosstalk from a wired loopback.
+
+`"de_control": false` makes the link release the pin to an input at startup.
+Refraining from asserting DE is not enough; the pin must stop being driven.
+
 ## DE timing — the measurement that mattered
 
 The bus may carry up to five other experiments, so every microsecond DE stays

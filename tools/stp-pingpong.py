@@ -204,6 +204,79 @@ def loopback(args) -> int:
     return 0 if passed == trials else 1
 
 
+#: Patterns chosen for what they look like on an oscilloscope, not for meaning.
+SCOPE_PATTERNS = {
+    # 8N1 sends LSB first, so 0x55 = 0101 0101 alternates every bit and gives a
+    # clean square wave at half the bit rate. The easiest way to measure baud.
+    "55": (0x55, "square wave at half the bit rate; period = 2 bit times"),
+    "AA": (0xAA, "as 0x55 but inverted phase"),
+    # Start bit plus eight zeros = nine consecutive low bit times, then the
+    # stop bit. The widest low pulse the format can produce.
+    "00": (0x00, "9 bit times low, then 1 high; widest low pulse possible"),
+    # Only the start bit is low, so a narrow negative-going pulse per byte.
+    "FF": (0xFF, "1 bit time low per byte; narrow pulses on an idle-high line"),
+}
+
+
+def scope(args) -> int:
+    """Transmit a continuous pattern for probing with an oscilloscope.
+
+    This is for the case where the link is dead and nothing electronic on
+    either end can tell you why. A repeating byte gives a signal whose timing
+    and amplitude can be measured directly, so the questions become concrete:
+    is the driver switching at all, at what rate, and with what swing?
+    """
+    handle = open_port(args)
+    byte, description = SCOPE_PATTERNS[args.pattern.upper().replace("0X", "")]
+    bit_us = 1e6 / args.baud
+    block = bytes([byte]) * 256
+
+    print(f"\nTransmitting 0x{byte:02X} continuously on {args.port} "
+          f"at {args.baud} baud.")
+    print(f"  {description}")
+    print()
+    print("  What to expect on a scope:")
+    print(f"    bit period            {bit_us:.3f} us")
+    print(f"    byte period (10 bits) {10 * bit_us:.3f} us")
+    if byte == 0x55:
+        print(f"    square wave period    {2 * bit_us:.3f} us "
+              f"({args.baud / 2 / 1000:.1f} kHz)")
+    print()
+    print("  Probe points, in order of what they rule out:")
+    print("    1. GPIO14 (pin 8) - the Pi's TXD. Activity here proves the UART")
+    print("       is transmitting and the pin mux is right.")
+    print("    2. The transceiver's DI input - proves the signal reaches it.")
+    print("    3. Y and Z, single-ended to ground - proves the driver switches.")
+    print("    4. Y minus Z, differential - should swing at least +/-2 V into")
+    print("       120 ohms. Much less means the driver is not enabled, or the")
+    print("       isolated supply is not running.")
+    print("    5. DE - should sit high the whole time, not pulse.")
+    print()
+    print("  Ctrl-C to stop.\n")
+
+    # No flush between blocks. tcdrain waits for the FIFO to empty, which puts
+    # an idle gap between every block and turns a continuous carrier into a
+    # burst - measured at a third of line rate. Writing without draining keeps
+    # the transmitter saturated, which is what makes a clean scope trace.
+    sent = 0
+    start = time.time()
+    try:
+        while args.seconds <= 0 or time.time() - start < args.seconds:
+            handle.write(block)
+            sent += len(block)
+            elapsed = time.time() - start
+            if sent % (256 * 40) == 0:
+                print(f"\r  {elapsed:7.1f}s   {sent:10d} bytes   "
+                      f"{sent * 10 / max(elapsed, 1e-9) / 1000:7.1f} kbit/s",
+                      end="", flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        handle.close()
+    print(f"\n\n  stopped after {sent} bytes")
+    return 0
+
+
 def stp_ping(args) -> int:
     """The same idea, but as real protocol packets."""
     handle = open_port(args)
@@ -265,6 +338,11 @@ def main() -> int:
     mode.add_argument("--echo", action="store_true")
     mode.add_argument("--loopback", action="store_true")
     mode.add_argument("--ping", action="store_true")
+    mode.add_argument("--scope", action="store_true",
+                      help="continuous pattern for oscilloscope probing")
+    ap.add_argument("--pattern", default="55",
+                    choices=["55", "AA", "00", "FF"],
+                    help="byte to repeat in --scope mode")
     args = ap.parse_args()
 
     if args.de_release:
@@ -280,6 +358,8 @@ def main() -> int:
         return echo(args)
     if args.loopback:
         return loopback(args)
+    if args.scope:
+        return scope(args)
     return stp_ping(args)
 
 
