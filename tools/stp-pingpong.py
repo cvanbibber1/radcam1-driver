@@ -205,6 +205,10 @@ def loopback(args) -> int:
 
 
 #: Patterns chosen for what they look like on an oscilloscope, not for meaning.
+#: Descending, because the question is how far down you must go before the
+#: link works. 9600 forgives almost any wiring fault that still connects.
+SWEEP_BAUDS = (921600, 460800, 230400, 115200, 57600, 19200, 9600)
+
 SCOPE_PATTERNS = {
     # 8N1 sends LSB first, so 0x55 = 0101 0101 alternates every bit and gives a
     # clean square wave at half the bit rate. The easiest way to measure baud.
@@ -396,6 +400,60 @@ def _report_rx(rx: bytes, wire, bursts: int = 0) -> int:
     return 1
 
 
+def tx_sweep(args) -> int:
+    """Transmit an identifiable pattern at each baud rate in turn.
+
+    A link that fails at 921600 may work perfectly at 9600. The bit period goes
+    from 1.085 us to 104 us, which forgives an enormous amount: unterminated
+    stubs, reflections, marginal connections, slew-rate limits, a transceiver
+    running out of drive. When a link will not come up at speed, the fastest
+    way to learn whether it works *at all* is to slow it down until it does.
+
+    Each rate announces itself in ASCII at that rate, so a host parked on one
+    rate sees readable text only while the sweep is passing through it.
+    """
+    print(f"\nSweeping transmit baud rates on {args.port}, "
+          f"{args.dwell:.0f} s at each.\n")
+    print("  Set the host to ONE rate and watch. When readable text appears")
+    print("  naming that rate, the link works there.\n")
+
+    for baud in SWEEP_BAUDS:
+        try:
+            handle = serial.Serial(args.port, baud, timeout=0.05)
+        except Exception as exc:                        # noqa: BLE001
+            print(f"  {baud:>7} baud: cannot open ({exc})")
+            continue
+
+        bit_us = 1e6 / baud
+        print(f"  {baud:>7} baud  (bit {bit_us:7.2f} us) ... ",
+              end="", flush=True)
+
+        line = (f"=== RADCAM AT {baud} BAUD === "
+                f"bit={bit_us:.2f}us ===\r\n").encode()
+        sent = 0
+        received = bytearray()
+        end = time.time() + args.dwell
+        try:
+            while time.time() < end:
+                handle.write(line)
+                sent += len(line)
+                chunk = handle.read(1024)
+                if chunk:
+                    received += chunk
+                time.sleep(0.05)
+            handle.flush()
+        finally:
+            handle.close()
+        print(f"sent {sent:6d} B, received {len(received):5d} B"
+              + (f"  <-- {printable(bytes(received[:24]))}" if received else ""))
+
+    print("\n  If one rate produced readable text on the host, use it:")
+    print("  change the stp \"baud\" in /etc/radcam/config.json and set the")
+    print("  host to match. A working link at 9600 is worth more than a broken")
+    print("  one at 921600; speed can come afterwards.")
+    return 0
+
+
 def stp_ping(args) -> int:
     """The same idea, but as real protocol packets."""
     handle = open_port(args)
@@ -461,6 +519,10 @@ def main() -> int:
                       help="continuous pattern for oscilloscope probing")
     mode.add_argument("--pingpong", action="store_true",
                       help="transmit continuously and decode anything received")
+    mode.add_argument("--tx-sweep", action="store_true",
+                      help="transmit at each baud rate in turn, slowest last")
+    ap.add_argument("--dwell", type=float, default=10.0,
+                    help="seconds at each rate in --tx-sweep")
     ap.add_argument("--pattern", default="55",
                     choices=["55", "AA", "00", "FF"],
                     help="byte to repeat in --scope mode")
@@ -483,6 +545,8 @@ def main() -> int:
         return scope(args)
     if args.pingpong:
         return pingpong(args)
+    if args.tx_sweep:
+        return tx_sweep(args)
     return stp_ping(args)
 
 
