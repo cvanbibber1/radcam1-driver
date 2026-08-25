@@ -277,6 +277,125 @@ def scope(args) -> int:
     return 0
 
 
+def pingpong(args) -> int:
+    """Transmit continuously and report anything that comes back.
+
+    Sends three things each cycle so that whatever the far end is prepared to
+    understand, something lands: a plain ASCII line a dumb terminal will show,
+    an 8-byte Command ACK, and a full 1256-byte LRT Data packet. Everything
+    received is classified rather than merely counted, because "12 bytes
+    arrived" and "12 bytes arrived that are a valid LRT request for 0xC7" call
+    for completely different next steps.
+    """
+    from radcam.stp import lrt as L
+
+    handle = open_port(args)
+    wire = P.Wire(target_id=args.target)
+    ack = P.encode_command_ack(wire, args.target)
+    lrt = P.encode_lrt_data(
+        L.build_lrt_payload({"target_id": args.target, "fw_major": 1,
+                             "dose_rad": 0.0731, "slot_count": 16}),
+        wire, args.target)
+
+    print(f"\nBidirectional ping on {args.port} at {args.baud} baud, "
+          f"target 0x{args.target:02X}.")
+    print("Each cycle sends: ASCII line, 8-byte ACK, 1256-byte LRT Data.")
+    print("Anything received is decoded and reported.\n")
+
+    cycles, reads = 0, 0
+    rx = bytearray()
+    start = time.time()
+    try:
+        while args.seconds <= 0 or time.time() - start < args.seconds:
+            cycles += 1
+            handle.write(f"RADCAM PING {cycles:06d}\r\n".encode())
+            handle.write(ack)
+            handle.write(lrt)
+            handle.flush()
+
+            deadline = time.time() + args.interval
+            while time.time() < deadline:
+                chunk = handle.read(4096)
+                if chunk:
+                    rx += chunk
+                    reads += 1
+                else:
+                    time.sleep(0.005)
+            print(f"  {time.time()-start:6.1f}s  TX {cycles:5d} cycles   "
+                  f"RX {len(rx):7d} B in {reads} reads", flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        handle.close()
+
+    print()
+    return _report_rx(bytes(rx), wire, bursts=cycles * 3)
+
+
+def _report_rx(rx: bytes, wire, bursts: int = 0) -> int:
+    """Say what arrived, and what it means."""
+    if not rx:
+        print("  Nothing was received.")
+        print("\n  If the host sees the ping, transmit is proven and the")
+        print("  return path - host TX to payload RX - carries nothing.")
+        return 1
+
+    print(f"  Received {len(rx)} bytes.")
+    print(f"    first 64 hex : {rx[:64].hex(' ').upper()}")
+    print(f"    as text      : {printable(rx[:64])}")
+    sync = rx.count(bytes.fromhex("1acffc1d"))
+    print(f"    sync patterns: {sync}")
+
+    if b"RADCAM PING" in rx:
+        print("\n  This contains our OWN ascii ping: the transmit pair is")
+        print("  looped into the receive pair. That proves the entire payload")
+        print("  path - UART, transceiver, DE, wiring - but it is not the host.")
+        return 0
+
+    if sync:
+        lengths = {0x10: 120, 0x81: 14, 0x85: 14, 0x86: 14, 0x87: 14}
+        names = {0x10: "COMMAND", 0x81: "LRT_REQUEST", 0x85: "HRT_STOP",
+                 0x86: "HRT_STOP_LOSS", 0x87: "HRT_GO"}
+        index = shown = 0
+        while shown < 6:
+            at = rx.find(bytes.fromhex("1acffc1d"), index)
+            if at < 0 or at + 12 > len(rx):
+                break
+            index, shown = at + 4, shown + 1
+            ptype, target = rx[at + 10], rx[at + 11]
+            size = lengths.get(ptype)
+            crc = ""
+            if size and at + size <= len(rx):
+                crc = ("  CRC ok" if wire.check_crc(rx[at:at + size], size - 2)
+                       else "  CRC BAD")
+            print(f"      @{at:6d}  {names.get(ptype, hex(ptype)):<14} "
+                  f"target 0x{target:02X}{crc}")
+        print("\n  Valid STP framing received: the link works both ways.")
+        return 0
+
+    unique = len(set(rx))
+    print(f"    distinct byte values: {unique}")
+
+    # The discriminator that matters is not how many distinct values arrived,
+    # but whether the count tracks the number of transmit *bursts* rather than
+    # the number of bytes sent. One received byte per burst, whatever the burst
+    # size, is the driver's switching edge coupling into the receive pair - it
+    # cannot be data, because data would scale with length.
+    if bursts and abs(len(rx) - bursts) <= max(3, bursts * 0.25):
+        print(f"\n  {len(rx)} bytes received for {bursts} transmit bursts -")
+        print("  almost exactly one per burst, independent of burst size.")
+        print("  That is our own driver switching, coupling into the receive")
+        print("  pair. It is not data, and it confirms two things: the")
+        print("  transmitter is driving the line, and the receive pair carries")
+        print("  nothing from the host.")
+    elif unique <= 3:
+        print("\n  Very few distinct values - likely coupling rather than data.")
+    else:
+        print("\n  Bytes arrive but do not frame as STP: suspect a baud")
+        print("  mismatch or an inverted pair on the return path.")
+    return 1
+
+
 def stp_ping(args) -> int:
     """The same idea, but as real protocol packets."""
     handle = open_port(args)
@@ -340,6 +459,8 @@ def main() -> int:
     mode.add_argument("--ping", action="store_true")
     mode.add_argument("--scope", action="store_true",
                       help="continuous pattern for oscilloscope probing")
+    mode.add_argument("--pingpong", action="store_true",
+                      help="transmit continuously and decode anything received")
     ap.add_argument("--pattern", default="55",
                     choices=["55", "AA", "00", "FF"],
                     help="byte to repeat in --scope mode")
@@ -360,6 +481,8 @@ def main() -> int:
         return loopback(args)
     if args.scope:
         return scope(args)
+    if args.pingpong:
+        return pingpong(args)
     return stp_ping(args)
 
 
