@@ -144,6 +144,13 @@ class ExperimentConfig:
     #: How long a service pass waits for the first byte. Bounds the latency
     #: added to an LRT reply, and the idle wake-up rate.
     poll_timeout_s: float = 0.005
+    #: Log every packet received and every reply sent. Verbose, and exactly
+    #: what bring-up needs: a silent link and a misaddressed one look
+    #: identical from the outside.
+    log_rx: bool = False
+    #: Append every received byte to this file, before any parsing. A decoder
+    #: bug should never cost the evidence.
+    rx_capture: str = ""
 
 
 class Experiment:
@@ -210,6 +217,17 @@ class Experiment:
         self.fine_time = 0
         self.consecutive_failures = 0
         self.poll_timeout_s = self.cfg.poll_timeout_s
+        #: Set once, so first contact on a link that has never worked is
+        #: unmissable in the log rather than buried in a byte count.
+        self._first_rx_logged = False
+        self._capture = None
+        if self.cfg.rx_capture:
+            try:
+                self._capture = open(self.cfg.rx_capture, "ab", buffering=0)
+                log.info("raw RX capture -> %s", self.cfg.rx_capture)
+            except Exception as exc:                   # noqa: BLE001
+                log.error("cannot open RX capture %s: %s",
+                          self.cfg.rx_capture, exc)
 
         self._result_lock = threading.Lock()
         self.last_opcode = 0
@@ -426,6 +444,12 @@ class Experiment:
     def stop(self) -> None:
         self._running.clear()
         self.scrubber.stop()
+        if self._capture is not None:
+            try:
+                self._capture.close()
+            except Exception:                          # noqa: BLE001
+                pass
+            self._capture = None
         if self._worker is not None:
             # Unblock the worker's get() so it can notice _running cleared.
             try:
@@ -457,6 +481,21 @@ class Experiment:
             else:
                 data = self.link.read()
 
+            if data:
+                if self._capture is not None:
+                    try:
+                        self._capture.write(data)
+                    except Exception:                  # noqa: BLE001
+                        pass
+                if not self._first_rx_logged:
+                    self._first_rx_logged = True
+                    log.info("FIRST BYTES RECEIVED on the RS-422 link: "
+                             "%d bytes, %s", len(data),
+                             data[:16].hex(" ").upper())
+                if self.cfg.log_rx:
+                    log.info("RX %4d bytes: %s", len(data),
+                             data[:32].hex(" ").upper())
+
             packets = self.reader.feed(data)
             if self._deferred:
                 # Anything picked up mid-transmission goes first: it arrived
@@ -465,6 +504,13 @@ class Experiment:
                 self._deferred = []
 
             for packet in packets:
+                if self.cfg.log_rx:
+                    ptype = getattr(packet, "packet_type", 0x10)
+                    name = {0x10: "COMMAND", 0x81: "LRT_REQUEST",
+                            0x85: "HRT_STOP", 0x86: "HRT_STOP_WITH_LOSS",
+                            0x87: "HRT_GO"}.get(ptype, f"0x{ptype:02X}")
+                    log.info("RX packet %-18s target 0x%02X", name,
+                             packet.target_id)
                 try:
                     self._on_packet(packet)
                     handled += 1
@@ -1063,6 +1109,14 @@ class Experiment:
 
     # ------------------------------------------------------------ transmit
 
+    def _log_tx(self, packet: bytes) -> None:
+        if not self.cfg.log_rx:
+            return
+        kind = {0x10: "ACK", 0x81: "LRT_DATA", 0x87: "HRT_DATA"}.get(
+            packet[4] if len(packet) > 5 else 0, "?")
+        log.info("TX %-8s %4d bytes  %s", kind, len(packet),
+                 packet[:12].hex(" ").upper())
+
     def _transmit(self, packet: bytes, abortable: bool = False) -> bool:
         """Send one packet. Only HRT is abortable.
 
@@ -1070,6 +1124,7 @@ class Experiment:
         asked for, and truncating one would leave the master with no reply at
         all. Only bulk HRT traffic is interruptible.
         """
+        self._log_tx(packet)
         try:
             ok = self.link.send(
                 packet, abort_check=self._abort_check if abortable else None)

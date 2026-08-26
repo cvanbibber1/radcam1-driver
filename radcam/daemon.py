@@ -306,6 +306,8 @@ class Daemon:
                 safe_mode_threshold=int(cfg.get("safe_mode_threshold", 5)),
                 hrt_idle_fill=bool(cfg.get("hrt_idle_fill", False)),
                 scrub_interval_s=float(cfg.get("scrub_interval_s", 30.0)),
+                log_rx=bool(cfg.get("log_rx", False)),
+                rx_capture=str(cfg.get("rx_capture", "")),
                 boot_count=self._boot_count()))
 
         # The ASCII beacon must never reach the DICE bus. Removing the port
