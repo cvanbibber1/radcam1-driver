@@ -28,8 +28,8 @@ Runs unattended on a Raspberry Pi 5, eventually booting from NVMe, power-minimis
 | Firmware | 2226a853 (2025/12/08) |
 | libcamera | 0.7.1+rpt20260609-1 |
 | rpicam-apps | 1.12.0-1 |
-| Root FS | microSD `mmcblk0p2` (target: migrate to NVMe) |
-| NVMe | `nvme0n1`, WD Green SN3000 500GB — present, **unpartitioned** |
+| Root FS | microSD `mmcblk0p2` — **boots from SD**, `BOOT_ORDER=0xf461` (SD, then NVMe, then USB) |
+| NVMe | `nvme0n1`, WD Green SN3000 500GB — **partitioned, holds a stale clone** (see below) |
 | ISP | PiSP (`pisp_be@880000`), front end `raspberrypi,rp1-cfe` |
 
 ## Hardware map
@@ -60,6 +60,13 @@ GPIO controller for all of the above is `gpiochip0` (`pinctrl-rp1`, 54 lines).
 | Ground debug | EXTUART — mirrors flight comms | TX=GPIO24, RX=GPIO23 |
 | Dosimeter | LTC2485IDDTRPBF (24-bit ΔΣ I2C ADC) | SDA=GPIO2, SCL=GPIO3 (`i2c-1`), ~2.5 mV/rad, needs one-time calibration persisted to storage |
 | Illumination | TPS922051D1DSGR LED driver | PWM on GPIO18, **software-capped at 10% duty** |
+
+> ⚠️ **The NVMe holds a clone from 2026-08-10 with no STP code.** It has a
+> valid `bootfs` + `rootfs` pair, and `BOOT_ORDER=0xf461` falls back to it if
+> the SD card fails to boot. That fallback would come up with no RS-422
+> protocol at all — no `radcam/stp`, no `stream.py`, no `slots.py`, and a
+> config with no `stp` section. Either refresh it or remove it from the boot
+> order before flight.
 
 ## Repository layout
 

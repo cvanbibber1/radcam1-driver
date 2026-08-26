@@ -452,6 +452,8 @@ with
 | Slot download refused with code 10 | the stored file failed its CRC-32; the bytes rotted, recapture |
 | A canned command runs only once | it was generated with `--no-force`; regenerate without that flag |
 | Link completely silent both ways | check DE wiring first — if the board ties DE active, set `"de_control": false` or software will hold the transmitter off |
+| Bytes arrive but are all `0xFF` | **inverted pair.** Swap the two wires of that pair — see `docs/reference/RS422_BRINGUP.md` §7. Confirm first with `tools/stp-pingpong.py --polarity` |
+| Bytes arrive but are all `0x00` | inverted pair the other way, or a line stuck low |
 | Payload receives nothing, `fe=0` | no signal reaching GPIO15 at all; a baud mismatch or reversed pair gives framing errors, not silence |
 | Need to prove the link electrically | `tools/stp-pingpong.py --scope` transmits a continuous square wave to probe |
 | Colours wrong, greys fine | something spectral, not gain — check for filters or tape over the sensor |
@@ -559,6 +561,9 @@ SLOT_DELETE slot=0             # free the slot for next time
 | `tools/stp-pingpong.py --raw-ping` | plain ASCII any terminal can see |
 | `tools/stp-pingpong.py --loopback` | prove the payload's whole path with a jumper |
 | `tools/stp-pingpong.py --scope` | continuous pattern for oscilloscope probing |
+| `tools/stp-pingpong.py --polarity` | alternate 0x00/0xFF to detect an inverted pair |
+| `tools/stp-pingpong.py --dc-test` | connectivity without needing correct framing |
+| `tools/stp-pingpong.py --tx-sweep` | transmit at every baud in turn, slowest last |
 | `tools/stp-verify.py` | 85 reliability, safety and autonomy checks |
 | `tools/stp-verify.py --suite safety` | one suite only |
 

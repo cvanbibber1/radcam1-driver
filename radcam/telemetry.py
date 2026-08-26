@@ -31,7 +31,11 @@ log = logging.getLogger(__name__)
 
 FLIGHT_PORT = "/dev/ttyAMA0"        # uart0, GPIO14 TXD / GPIO15 RXD -> RS422
 DEBUG_PORT = "/dev/ttyAMA10"        # Pi 5 dedicated debug UART header
-DEFAULT_BAUD = 115200
+#: 921600 everywhere. This was 115200 for the legacy ASCII beacon while
+#: protocol.md's whole link budget assumed 921600 - an 8x discrepancy that made
+#: every transfer estimate wrong. The mission has since confirmed 921600 and the
+#: rate is proven on the hardware, so the two agree at last.
+DEFAULT_BAUD = 921600
 
 FRAME_START = "$"
 CRC_SEP = "*"
