@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import struct
+import zlib
 import sys
 import time
 
@@ -75,6 +77,79 @@ def build_hrt(wire: P.Wire, target: int, index: int, total: int) -> bytes:
     return P.encode_hrt_data(payload, wire, target)
 
 
+def transmit_file(link, wire, target, path: str, group_size: int,
+                  repeat: bool = True, seconds: float = 60.0) -> int:
+    """Send a real file over HRT as a complete, conformant transfer.
+
+    Emits the same sequence a commanded download does - MEDIA_INFO, numbered
+    MEDIA_DATA chunks, XOR parity every `group_size`, then MEDIA_END with the
+    whole-file CRC-32 - so a ground station that reassembles this correctly
+    will reassemble a real capture correctly. Repeating it means a receiver can
+    join at any point and still get a whole file from the next MEDIA_INFO.
+    """
+    from radcam.stp.fec import group_count, indices_in_group, parity_of
+
+    data = open(path, "rb").read()
+    file_crc = zlib.crc32(data) & 0xFFFFFFFF
+    chunk_total = max(1, -(-len(data) // H.HRT_CHUNK_DATA))
+
+    def chunk(i):
+        return data[i * H.HRT_CHUNK_DATA:(i + 1) * H.HRT_CHUNK_DATA]
+
+    print(f"  file      : {path}")
+    print(f"  size      : {len(data)} bytes, CRC-32 0x{file_crc:08X}")
+    print(f"  chunks    : {chunk_total} of {H.HRT_CHUNK_DATA} B"
+          f" + {group_count(chunk_total, group_size)} parity")
+    print()
+
+    passes = 0
+    start = time.time()
+    while time.time() - start < seconds:
+        passes += 1
+        link.send(P.encode_hrt_data(H.build_hrt_payload(
+            H.SubType.MEDIA_INFO, 0x51000000, 0, chunk_total,
+            H.encode_media_info(0x51000000, len(data), chunk_total, file_crc,
+                                0, 640, 480, time.time())), wire, target))
+
+        for index in range(chunk_total):
+            flags = H.FLAG_LAST_CHUNK if index == chunk_total - 1 else 0
+            link.send(P.encode_hrt_data(H.build_hrt_payload(
+                H.SubType.MEDIA_DATA, 0x51000000, index, chunk_total,
+                chunk(index), flags), wire, target))
+
+            # Parity as each group closes, so an interrupted transfer still
+            # leaves completed groups repairable.
+            if group_size and (index + 1) % group_size == 0:
+                group = index // group_size
+                link.send(P.encode_hrt_data(H.build_hrt_payload(
+                    H.SubType.MEDIA_PARITY, 0x51000000, group, chunk_total,
+                    parity_of([chunk(i) for i in
+                               indices_in_group(group, group_size, chunk_total)],
+                              H.HRT_CHUNK_DATA), H.FLAG_PARITY), wire, target))
+
+        if group_size:
+            last = group_count(chunk_total, group_size) - 1
+            if last >= 0 and chunk_total % group_size:
+                link.send(P.encode_hrt_data(H.build_hrt_payload(
+                    H.SubType.MEDIA_PARITY, 0x51000000, last, chunk_total,
+                    parity_of([chunk(i) for i in
+                               indices_in_group(last, group_size, chunk_total)],
+                              H.HRT_CHUNK_DATA), H.FLAG_PARITY), wire, target))
+
+        link.send(P.encode_hrt_data(H.build_hrt_payload(
+            H.SubType.MEDIA_END, 0x51000000, chunk_total, chunk_total,
+            struct.pack(">III", 0x51000000, file_crc, chunk_total)),
+            wire, target))
+
+        print(f"\r  pass {passes:4d} complete   {link.tx_bytes:9d} bytes sent",
+              end="", flush=True)
+        if not repeat:
+            break
+        time.sleep(1.0)
+    print()
+    return passes
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -89,6 +164,10 @@ def main() -> int:
     ap.add_argument("--hrt", action="store_true",
                     help="also send a repeating file transfer over HRT")
     ap.add_argument("--hrt-chunks", type=int, default=8)
+    ap.add_argument("--image", metavar="FILE",
+                    help="transmit a real file over HRT as a full transfer")
+    ap.add_argument("--fec-group", type=int, default=16,
+                    help="parity group size for --image")
     ap.add_argument("--ack-only", action="store_true",
                     help="send only 8-byte ACKs - the smallest valid packet")
     args = ap.parse_args()
@@ -107,6 +186,14 @@ def main() -> int:
     print(f"\nBeaconing on {args.port} at {args.baud} baud as target "
           f"0x{args.target:02X} for {args.seconds:.0f} s.")
     print("This is a bench tool. The payload does not do this in normal use.\n")
+
+    if args.image:
+        try:
+            transmit_file(link, wire, args.target, args.image,
+                          args.fec_group, True, args.seconds)
+        finally:
+            link.close()
+        return 0
 
     started = time.time()
     interval = 1.0 / max(args.lrt_hz, 0.01)
