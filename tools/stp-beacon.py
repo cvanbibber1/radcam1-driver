@@ -150,6 +150,96 @@ def transmit_file(link, wire, target, path: str, group_size: int,
     return passes
 
 
+def stream_forever(link, wire, target, args) -> int:
+    """Live video over HRT, with telemetry interleaved, until stopped.
+
+    The payload never does this unsolicited in flight - HRT flows only between
+    an HRT Go and a Stop. This exists for a bench where the return path is not
+    yet working, so the ground can develop against a real stream rather than a
+    recording.
+
+    Two rules from the flight code carry over because they are what make a
+    stream a stream. Frames are taken newest-available and stale ones are
+    dropped rather than queued, since on a fixed-rate link a queue converts a
+    bandwidth shortfall into latency that only grows. And telemetry is
+    interleaved between whole frames, never inside one, so a frame is never
+    split around 13.7 ms of LRT.
+    """
+    from radcam.stream import StreamConfig, VideoStream
+
+    cfg = StreamConfig(width=args.width, height=args.height, fps=args.fps,
+                       bitrate=args.bitrate, crop_w=args.crop_w or args.width,
+                       crop_h=args.crop_h or args.height,
+                       centre_x=args.centre_x, centre_y=args.centre_y)
+    stream = VideoStream(cfg, queue_frames=args.queue)
+    if not stream.available:
+        print(f"  cannot stream, missing: {', '.join(stream.missing())}")
+        return 2
+    if not stream.start():
+        print(f"  encoder failed to start: {stream.fault}")
+        return 2
+
+    applied = stream.config
+    hrt_ms = (P.HRT_DATA_PACKET_SIZE * 10 / args.baud + 30e-6) * 1000
+    print(f"  stream    : {applied.describe()}")
+    print(f"  HRT packet: {hrt_ms:.2f} ms   budget {1000/applied.fps:.1f} ms/frame")
+    print(f"  telemetry : every {args.lrt_period:.0f} s, between frames")
+    print()
+
+    frame_no = 0
+    chunks_sent = 0
+    lrt_sent = 0
+    dropped_seen = 0
+    next_lrt = time.time() + args.lrt_period
+    started = time.time()
+    last_report = started
+
+    try:
+        while True:
+            frame = stream.take()
+            if frame is None:
+                # Between frames is exactly when telemetry should go out.
+                if time.time() >= next_lrt:
+                    next_lrt = time.time() + args.lrt_period
+                    link.send(build_lrt(wire, target, lrt_sent, started))
+                    lrt_sent += 1
+                else:
+                    time.sleep(0.002)
+                continue
+
+            data = frame.data
+            total = max(1, -(-len(data) // H.HRT_CHUNK_DATA))
+            for index in range(total):
+                piece = data[index * H.HRT_CHUNK_DATA:
+                             (index + 1) * H.HRT_CHUNK_DATA]
+                flags = H.FLAG_KEYFRAME if frame.keyframe else 0
+                if index == total - 1:
+                    flags |= H.FLAG_LAST_CHUNK
+                link.send(P.encode_hrt_data(H.build_hrt_payload(
+                    H.SubType.STREAM_DATA, frame.index, index, total,
+                    piece, flags), wire, target))
+                chunks_sent += 1
+            frame_no += 1
+
+            now = time.time()
+            if now - last_report >= 2.0:
+                last_report = now
+                elapsed = now - started
+                dropped_seen = stream.frames_dropped
+                print(f"\r  {elapsed:7.0f}s  frames {frame_no:6d} "
+                      f"({frame_no/elapsed:5.2f} fps)  chunks {chunks_sent:8d}  "
+                      f"LRT {lrt_sent:5d}  dropped {dropped_seen:5d}  "
+                      f"{link.tx_bytes*8/elapsed/1000:6.0f} kbit/s",
+                      end="", flush=True)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stream.stop()
+        link.close()
+    print()
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -168,6 +258,19 @@ def main() -> int:
                     help="transmit a real file over HRT as a full transfer")
     ap.add_argument("--fec-group", type=int, default=16,
                     help="parity group size for --image")
+    ap.add_argument("--stream", action="store_true",
+                    help="live video over HRT, with telemetry interleaved")
+    ap.add_argument("--width", type=int, default=640)
+    ap.add_argument("--height", type=int, default=480)
+    ap.add_argument("--fps", type=int, default=15)
+    ap.add_argument("--bitrate", type=int, default=600000)
+    ap.add_argument("--crop-w", type=int, default=0)
+    ap.add_argument("--crop-h", type=int, default=0)
+    ap.add_argument("--centre-x", type=int, default=2104)
+    ap.add_argument("--centre-y", type=int, default=1560)
+    ap.add_argument("--queue", type=int, default=8)
+    ap.add_argument("--lrt-period", type=float, default=2.0,
+                    help="seconds between telemetry packets in --stream")
     ap.add_argument("--ack-only", action="store_true",
                     help="send only 8-byte ACKs - the smallest valid packet")
     args = ap.parse_args()
@@ -187,6 +290,9 @@ def main() -> int:
           f"0x{args.target:02X} for {args.seconds:.0f} s.")
     print("This is a bench tool. The payload does not do this in normal use.\n")
 
+    if args.stream:
+        return stream_forever(link, wire, args.target, args)
+
     if args.image:
         try:
             transmit_file(link, wire, args.target, args.image,
@@ -202,7 +308,7 @@ def main() -> int:
     chunk = 0
 
     try:
-        while time.time() - started < args.seconds:
+        while args.seconds <= 0 or time.time() - started < args.seconds:
             now = time.time()
             if now >= next_lrt:
                 next_lrt += interval
