@@ -11,6 +11,19 @@ rewrite.
 The mission has confirmed **CRC-16/CCITT-FALSE** (poly 0x1021, init 0xFFFF, no
 reflection, no final XOR), which is the default here.
 
+**Verified against the flight computer's own implementation.** DICE computes
+packet checksums with a precomputed CRC-16/CCITT table over `data[4:length]`,
+where the caller sets `length` to the CRC field's offset. That source is
+transcribed verbatim in `tests/test_stp_crc_flight.py` and asserted to agree
+with this module over every packet class on the link, on random content and on
+the degenerate all-zero and all-ones cases where a wrong initial value would
+show. Their table is generated from polynomial 0x1021, MSB-first, and matches
+one generated here entry for entry.
+
+That test is not this module checked against itself in another form - it is
+this module checked against the other end of the link, which is the only
+comparison that decides whether packets are accepted.
+
 `solve()` exists for the case where that turns out to be wrong. Given captured
 known-good packets it searches the standard parameter space - including the
 coverage range and the stored byte order - and reports every variant that
