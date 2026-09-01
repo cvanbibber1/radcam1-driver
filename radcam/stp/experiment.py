@@ -94,6 +94,12 @@ class StpOp:
     SLOT_DELETE_ALL = 0x6B
     SLOT_DOWNLOAD_ABORT = 0x6C
 
+    # -- camera selection --------------------------------------------------
+    # Exactly one camera may be enabled at a time: two sensors sharing an I2C
+    # address answer together, and two driving the same CSI lanes contend.
+    SELECT_CAMERA = 0x6D
+    CAMERA_LIST = 0x6E
+
     # -- link management -------------------------------------------------
     CLEAR_SAFE_MODE = 0x70
     ABORT_TRANSFERS = 0x71
@@ -157,7 +163,8 @@ class Experiment:
     def __init__(self, link, wire: Wire = DEFAULT_WIRE,
                  dispatcher=None, store=None, state_provider=None,
                  config: ExperimentConfig | None = None,
-                 events: L.EventLog | None = None, stream=None, slots=None):
+                 events: L.EventLog | None = None, stream=None, slots=None,
+                 cameras=None):
         self.link = link
         self.wire = wire
         self.dispatcher = dispatcher
@@ -176,6 +183,7 @@ class Experiment:
         #: which never streams pays nothing for the capability.
         self.stream = stream
         self.slots = slots
+        self.cameras = cameras
         self._stream_frame: bytes | None = None
         self._stream_chunk = 0
         self._stream_chunks = 0
@@ -416,6 +424,52 @@ class Experiment:
             "<BIf", index, slot.size if slot else 0,
             slot.duration_s if slot else 0.0))
 
+    def _camera_command(self, request) -> None:
+        """Select which camera is enabled, or report the table.
+
+        Selection disables every camera and then enables one, so the ground
+        cannot ask for two at once and a partial failure leaves the fabric
+        quiet rather than contended. Index 0xFF disables all of them, which is
+        a legitimate low-power state rather than an error.
+        """
+        from ..cameras import MAX_CAMERAS, NO_CAMERA
+
+        if self.cameras is None or not self.cameras.is_open:
+            return self._fail(request, Err.CAMERA_FAULT)
+
+        if request.opcode == StpOp.CAMERA_LIST:
+            return self._succeed(request, self.cameras.pack_table())
+
+        if not request.args:
+            return self._fail(request, Err.BAD_PARAM)
+        index = request.args[0]
+        if index != NO_CAMERA and index >= MAX_CAMERAS:
+            return self._fail(request, Err.BAD_PARAM)
+
+        # Switching the sensor out from under a running stream or recording
+        # would leave both pointing at hardware that is no longer there.
+        if self.stream is not None and getattr(self.stream, "running", False):
+            log.info("stopping the stream before switching camera")
+            try:
+                self.stream.stop()
+            except Exception as exc:                   # noqa: BLE001
+                log.error("stopping the stream failed: %s", exc)
+            self._drop_stream_frame()
+        if self.slots is not None and self.slots.recording_slot is not None:
+            log.info("ending the recording before switching camera")
+            self._slot_record_stop(None)
+
+        if not self.cameras.select(index):
+            self.events.add(L.EventCode.CAMERA_FAULT, arg=index,
+                            severity=L.SEV_ERROR)
+            return self._fail(request, Err.CAMERA_FAULT)
+
+        self.events.add(L.EventCode.COMMAND_ACCEPTED, arg=index)
+        entry = self.cameras.active_entry()
+        return self._succeed(request, struct.pack(
+            "<BBB", index, self.cameras.entries and len(self.cameras.entries) or 0,
+            entry.gpio & 0xFF if entry else 0))
+
     def tick(self) -> None:
         """Time-driven housekeeping, called once per service pass.
 
@@ -653,6 +707,9 @@ class Experiment:
 
         if StpOp.SLOT_LIST <= opcode <= StpOp.SLOT_DOWNLOAD_ABORT:
             return self._slot_command(request)
+
+        if opcode in (StpOp.SELECT_CAMERA, StpOp.CAMERA_LIST):
+            return self._camera_command(request)
 
         if opcode in (StpOp.STREAM_START, StpOp.STREAM_STOP,
                       StpOp.STREAM_SET_REGION, StpOp.STREAM_SET_OUTPUT):
@@ -1000,6 +1057,8 @@ class Experiment:
         })
         state.update(self.transfers.status())
         state["fec_group_size"] = self.cfg.fec_group_size
+        if self.cameras is not None:
+            state.update(self.cameras.summary())
         if self.slots is not None:
             state.update(self.slots.summary())
             # Report the transfer in progress as a slot number when it is one,

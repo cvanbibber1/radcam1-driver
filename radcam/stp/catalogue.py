@@ -148,6 +148,14 @@ CATALOGUE: tuple[CommandSpec, ...] = (
     CommandSpec("SLOT_DELETE_ALL", StpOp.SLOT_DELETE_ALL,
                 "Free every slot", "slots"),
 
+    # -- camera selection -------------------------------------------------
+    CommandSpec("CAMERA_LIST", StpOp.CAMERA_LIST,
+                "Every camera: index, enable GPIO, which one is on", "imaging"),
+    CommandSpec("SELECT_CAMERA", StpOp.SELECT_CAMERA,
+                "Enable one camera and disable all others; 0xFF disables all",
+                "imaging",
+                (Field("camera", _U8, 0, "camera index 0-15, or 255 for none"),)),
+
     # -- transfer ---------------------------------------------------------
     CommandSpec("SLOT_DOWNLOAD", StpOp.SLOT_DOWNLOAD,
                 "Queue a slot for HRT transfer", "transfer",

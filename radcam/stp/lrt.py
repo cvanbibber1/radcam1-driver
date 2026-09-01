@@ -175,6 +175,15 @@ OFF_SLOT_RECORDING = 757          # 0xFF when nothing is recording
 OFF_SLOT_BYTES_USED = 758
 OFF_SLOT_DOWNLOADING = 766        # 0xFF when no slot transfer is queued
 
+# ---- camera selection -----------------------------------------------------
+# Which camera is enabled, out of up to 16. Exactly one may be on at a time,
+# so this is a single index rather than a bitmask - the protocol cannot express
+# the unsafe state. 0xFF means all disabled, a legitimate low-power condition.
+OFF_CAMERA_COUNT = 767
+OFF_CAMERA_ACTIVE = 768
+OFF_CAMERA_SELECTIONS = 769
+OFF_CAMERA_FAILURES = 771
+
 #: Live stream states, reported in OFF_STREAM_STATE.
 STREAM_OFF, STREAM_STARTING, STREAM_RUNNING, STREAM_FAULT = 0, 1, 2, 3
 
@@ -184,11 +193,11 @@ STREAM_FLAG_GATED = 0x01
 STREAM_FLAG_ENCODER_LATE = 0x02
 
 # ---- event ring -----------------------------------------------------------
-OFF_EVENT_COUNT = 770
-OFF_EVENTS = OFF_EVENT_COUNT + 2                                 # 772
+OFF_EVENT_COUNT = 776
+OFF_EVENTS = OFF_EVENT_COUNT + 2                                 # 778
 EVENT_SIZE = 12
 OFF_PAYLOAD_CRC32 = 1244
-MAX_EVENTS = (OFF_PAYLOAD_CRC32 - OFF_EVENTS) // EVENT_SIZE      # 39
+MAX_EVENTS = (OFF_PAYLOAD_CRC32 - OFF_EVENTS) // EVENT_SIZE      # 38
 
 #: Transfer states reported in OFF_XFER_STATE.
 XFER_IDLE, XFER_ACTIVE, XFER_PAUSED, XFER_COMPLETE = 0, 1, 2, 3
@@ -409,6 +418,13 @@ def build_lrt_payload(state: dict, events: list[Event] | None = None) -> bytes:
     downloading = int(g("slot_downloading", -1))
     buf[OFF_SLOT_DOWNLOADING] = 0xFF if downloading < 0 else downloading & 0xFF
 
+    buf[OFF_CAMERA_COUNT] = int(g("camera_count", 0)) & 0xFF
+    buf[OFF_CAMERA_ACTIVE] = int(g("camera_active", 0xFF)) & 0xFF
+    _pack_into(buf, OFF_CAMERA_SELECTIONS, "H",
+               int(g("camera_selections", 0)) & 0xFFFF)
+    _pack_into(buf, OFF_CAMERA_FAILURES, "H",
+               int(g("camera_select_failures", 0)) & 0xFFFF)
+
     events = events or []
     n = min(len(events), MAX_EVENTS)
     _pack_into(buf, OFF_EVENT_COUNT, "H", n)
@@ -530,6 +546,10 @@ def decode_lrt_payload(payload: bytes) -> dict:
         "slot_bytes_used": u("Q", OFF_SLOT_BYTES_USED),
         "slot_downloading": (-1 if payload[OFF_SLOT_DOWNLOADING] == 0xFF
                              else payload[OFF_SLOT_DOWNLOADING]),
+        "camera_count": payload[OFF_CAMERA_COUNT],
+        "camera_active": payload[OFF_CAMERA_ACTIVE],
+        "camera_selections": u("H", OFF_CAMERA_SELECTIONS),
+        "camera_select_failures": u("H", OFF_CAMERA_FAILURES),
     })
 
     for offset, key in ((OFF_RX_GOOD, "rx_good"),

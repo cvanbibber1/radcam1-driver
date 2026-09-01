@@ -43,6 +43,7 @@ from .stp.experiment import Experiment, ExperimentConfig
 from .stp.link import DeLine, NullDeLine, Rs422Link
 from .stp.lrt import EventCode, EventLog
 from .stp.packets import Wire
+from .cameras import CameraSelector, entries_from_config
 from .slots import DEFAULT_SLOTS, SlotStore
 from .stream import StreamConfig, VideoStream
 
@@ -223,6 +224,7 @@ class Daemon:
         self.stp_link: Rs422Link | None = None
         self.stream: VideoStream | None = None
         self.slots: SlotStore | None = None
+        self.cameras: CameraSelector | None = None
         self.stp_events = EventLog()
         self._stp_thread = None
         self._stp_state: dict = {}
@@ -290,6 +292,14 @@ class Daemon:
 
         # Numbered slots, so a canned command from the ground addresses the
         # same place every time regardless of capture history.
+        # Camera enable lines. Defaults to the two connector enables this board
+        # carries; a downstream build with more cameras names its own.
+        self.cameras = CameraSelector(
+            entries_from_config(cfg.get("cameras")),
+            chip=str(cfg.get("camera_chip", "/dev/gpiochip0")))
+        if self.cameras.entries:
+            self.cameras.open()
+
         self.slots = SlotStore(
             directory=cfg.get("slot_dir", "/var/lib/radcam/slots"),
             count=int(cfg.get("slot_count", DEFAULT_SLOTS)))
@@ -298,6 +308,7 @@ class Daemon:
             link=self.stp_link, wire=wire, dispatcher=self.dispatcher,
             store=self.media, state_provider=lambda: self._stp_state,
             events=self.stp_events, stream=self.stream, slots=self.slots,
+            cameras=self.cameras,
             config=ExperimentConfig(
                 target_id=wire.target_id,
                 version=str(cfg.get("version", "1.0")),
@@ -479,6 +490,11 @@ class Daemon:
         self.running = False
 
     def shutdown(self) -> None:
+        if self.cameras is not None:
+            try:
+                self.cameras.close()
+            except Exception as exc:                   # noqa: BLE001
+                log.error("closing camera selector failed: %s", exc)
         if self.stream is not None:
             # Two child processes; leaving them behind would hold the camera
             # against the next start.
