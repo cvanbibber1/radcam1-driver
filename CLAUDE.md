@@ -264,6 +264,10 @@ a CRC-32 checked on read; the index is TMR-protected.
 
 ### Commands as hex strings
 
+The ground station is specified in `docs/host/HOST_APP_SPEC.md`, with
+`docs/host/HOST_APP_UPDATE_SPEC.md` carrying the multi-camera and
+configurable-CRC delta (including an LRT layout fix the base spec gets wrong).
+
 `radcam/stp/catalogue.py` holds the command set as data; `tools/stp-command.py`
 renders pasteable 120-byte hex strings and `--verify` proves all 39 are
 accepted by a real decoder. Canned strings set the force flag, or a second

@@ -16,6 +16,12 @@ source**. Every constant, offset and algorithm needed to interoperate is here.
 
 ---
 
+> ⚠️ **This spec predates multi-camera support and the configurable CRC.** Its
+> LRT layout is out of date: the camera block now occupies offsets 767-775 and
+> the event ring moved from 770 to 776. Read
+> **[`HOST_APP_UPDATE_SPEC.md`](HOST_APP_UPDATE_SPEC.md)** alongside it - that
+> document is the delta, and §0 is a correctness fix against live firmware.
+
 ## Contents
 
 1. [Scope and roles](#1-scope-and-roles)
