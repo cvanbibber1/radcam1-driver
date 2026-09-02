@@ -37,6 +37,31 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from radcam.stp import catalogue as C                  # noqa: E402
 from radcam.stp.packets import Wire                    # noqa: E402
+from radcam.stp import crc as crcmod                    # noqa: E402
+
+
+def wire_from_config(target: int, path: str) -> Wire:
+    """Build the wire from the live config, so generated hex is not stale.
+
+    A canned hex string carries its own CRC. If the payload's CRC settings are
+    changed and these strings are not regenerated with them, every canned
+    command silently stops being accepted - so read the same file the daemon
+    reads rather than assuming the defaults.
+    """
+    stp = {}
+    try:
+        import json
+        with open(path) as handle:
+            stp = (json.load(handle).get("stp") or {})
+    except (OSError, ValueError):
+        pass                       # no config here: the defaults are correct
+    params, problems = crcmod.from_config(stp)
+    for problem in problems:
+        print(f"  !! config: {problem}", file=sys.stderr)
+    return Wire(big_endian=bool(stp.get("big_endian", True)),
+                crc=params, target_id=target,
+                crc_start=int(stp.get("crc_start", 4)),
+                lrt_trailer=str(stp.get("lrt_trailer", "crc")))
 
 DEFAULT_TARGET = 0xC7
 
@@ -235,9 +260,11 @@ def main() -> int:
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--markdown", action="store_true")
     ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--config", default="/etc/radcam/config.json",
+                    help="read CRC and byte order from this config")
     args = ap.parse_args()
 
-    wire = Wire(target_id=args.target)
+    wire = wire_from_config(args.target, args.config)
     force = not args.no_force
 
     if args.list:

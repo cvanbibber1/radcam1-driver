@@ -330,7 +330,15 @@ other experiments. The transmitter uses `TIOCSERGETLSR`/`TIOCSER_TEMT` instead
 and releases within **~30 µs at any packet size**, sustaining 89 kB/s of HRT
 payload at 99.7% wire utilisation. Re-verify with `tools/stp-de-timing.py`.
 
+Wire settings — CRC, target id, coverage window, DE, cameras — are changed
+with `tools/rs422-tweak.py` and documented in **`docs/rs422tweak.md`**, which
+is also the pre-test checklist. The CRC is fully expressible in configuration
+(named variant or explicit poly/init/reflection/xor/store), so a disagreement
+with the flight computer is a config change, never a rewrite.
+
 ```bash
+tools/rs422-tweak.py show      # every wire setting, as the daemon reads it
+tools/rs422-tweak.py sample    # real packets, for the ground to check against
 tools/stp-verify.py            # 85 reliability / safety / autonomy checks
 tools/stp-sim.py --self-test   # 21-check protocol conversation, no hardware
 tools/stp-de-timing.py --throughput

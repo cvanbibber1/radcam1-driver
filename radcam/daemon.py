@@ -38,12 +38,13 @@ from .piolink import PioLink
 from .ltc2485 import LTC2485
 from .telemetry import (DEFAULT_BAUD, FLIGHT_PORT, NullTelemetryLink,
                          PortConfig, Telemetry)
-from .stp.crc import CATALOG as CRC_CATALOG, CCITT_FALSE
+from .stp.crc import (from_config as crc_from_config,
+                      describe as crc_describe)
 from .stp.experiment import Experiment, ExperimentConfig
 from .stp.link import DeLine, NullDeLine, Rs422Link
 from .stp.lrt import EventCode, EventLog
 from .stp.packets import Wire
-from .cameras import CameraSelector, entries_from_config
+from .cameras import CameraSelector, entries_from_config, NO_CAMERA
 from .slots import DEFAULT_SLOTS, SlotStore
 from .stream import StreamConfig, VideoStream
 
@@ -235,16 +236,10 @@ class Daemon:
         if not cfg.get("enabled"):
             return
 
-        crc = CCITT_FALSE
-        wanted = str(cfg.get("crc_variant", "CRC-16/CCITT-FALSE")).upper()
-        for candidate in CRC_CATALOG:
-            if candidate.name.upper() == wanted or \
-                    candidate.name.upper().endswith(wanted):
-                crc = candidate
-                break
-        else:
-            log.warning("unknown crc_variant %r; using %s",
-                        cfg.get("crc_variant"), crc.name)
+        crc, crc_problems = crc_from_config(cfg)
+        for problem in crc_problems:
+            log.warning("CRC config: %s", problem)
+        log.info("CRC: %s", crc_describe(crc, int(cfg.get("crc_start", 4))))
 
         wire = Wire(
             big_endian=bool(cfg.get("big_endian", True)),
@@ -277,7 +272,12 @@ class Daemon:
         # Live video is constructed but not started: the encoder is a real
         # cost in CPU and power, and nothing should be running until the
         # ground asks for it.
-        stream_cfg = cfg.get("stream") or {}
+        # `stream`, `cameras` and `default_camera` are documented as top-level
+        # config keys, so read them there first and accept them inside the
+        # `stp` block too. Reading only the stp block silently ignored the
+        # top-level ones, and because the file's values matched the code's
+        # defaults, that looked exactly like it was working.
+        stream_cfg = cfg.get("stream") or self.cfg.get("stream") or {}
         self.stream = VideoStream(
             StreamConfig(
                 width=int(stream_cfg.get("width", 640)),
@@ -295,8 +295,11 @@ class Daemon:
         # Camera enable lines. Defaults to the two connector enables this board
         # carries; a downstream build with more cameras names its own.
         self.cameras = CameraSelector(
-            entries_from_config(cfg.get("cameras")),
-            chip=str(cfg.get("camera_chip", "/dev/gpiochip0")))
+            entries_from_config(cfg.get("cameras") or self.cfg.get("cameras")),
+            chip=str(cfg.get("camera_chip", "/dev/gpiochip0")),
+            default_camera=int(cfg.get("default_camera",
+                                       self.cfg.get("default_camera",
+                                                    NO_CAMERA))))
         if self.cameras.entries:
             self.cameras.open()
 

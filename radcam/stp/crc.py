@@ -195,3 +195,125 @@ def _matches(packet: bytes, params: Crc16Params, start: int,
         return False
     stored = params.unpack(packet[end:end + 2])
     return params.compute(packet[start:end]) == stored
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+#
+# The CRC is the single most likely thing to be wrong at first contact with a
+# flight computer, and being wrong about it makes every packet look like noise
+# to the other end while looking perfectly correct from here. So it is fully
+# expressible in configuration - not just "pick one of these names", but the
+# whole Rocksoft parameter set - and `from_config` is the one place that
+# mapping lives.
+# ---------------------------------------------------------------------------
+
+#: Config keys that name an explicit parameter. Any of them present switches
+#: to a custom CRC, using the named variant (or CCITT-FALSE) as the base for
+#: whatever is not overridden.
+_PARAM_KEYS = ("crc_poly", "crc_init", "crc_reflect_in", "crc_reflect_out",
+               "crc_xor_out", "crc_store")
+
+
+def _as_int(value) -> int:
+    """Accept 0x1021, "0x1021", "1021h" or 4129 alike.
+
+    Hand-edited flight configuration is written by people reading a datasheet,
+    who write polynomials in hex. JSON has no hex literal, so a string has to
+    be accepted or the obvious edit silently means the wrong number.
+    """
+    if isinstance(value, bool):
+        raise ValueError("expected a number, got a boolean")
+    if isinstance(value, int):
+        return value
+    text = str(value).strip().lower().replace("_", "")
+    if text.endswith("h"):
+        text = "0x" + text[:-1]
+    return int(text, 0)
+
+
+def find(name: str) -> Crc16Params | None:
+    """Look up a catalogue variant by name, tolerantly.
+
+    "CRC-16/CCITT-FALSE", "ccitt-false" and "CCITT_FALSE" all find the same
+    entry, because those are all things a person reasonably types.
+    """
+    wanted = str(name).upper().replace("_", "-").strip()
+    for candidate in CATALOG:
+        cname = candidate.name.upper()
+        if cname == wanted or cname.endswith("/" + wanted) or \
+                cname.split("/")[-1] == wanted:
+            return candidate
+    return None
+
+
+def from_config(cfg: dict) -> tuple[Crc16Params, list[str]]:
+    """Build the CRC from an `stp` config block.
+
+    Returns the parameters and a list of human-readable problems. Problems are
+    returned rather than raised: a mistyped CRC name must not stop the payload
+    coming up, because a payload that does not answer at all is worse than one
+    answering with the wrong checksum - the second is diagnosable from the
+    ground, the first is indistinguishable from dead hardware.
+    """
+    problems: list[str] = []
+    name = str(cfg.get("crc_variant", CCITT_FALSE.name))
+
+    if name.upper() == "CUSTOM":
+        base = CCITT_FALSE
+    else:
+        base = find(name)
+        if base is None:
+            problems.append(
+                f"unknown crc_variant {name!r}; using {CCITT_FALSE.name}. "
+                f"Known: {', '.join(c.name for c in CATALOG)}")
+            base = CCITT_FALSE
+
+    overrides = {k: cfg[k] for k in _PARAM_KEYS if k in cfg}
+    if not overrides and name.upper() != "CUSTOM":
+        return base, problems
+
+    poly, init, xor_out = base.poly, base.init, base.xor_out
+    refin, refout, big = base.reflect_in, base.reflect_out, base.big_endian_store
+    for key, raw in overrides.items():
+        try:
+            if key == "crc_poly":
+                poly = _as_int(raw) & 0xFFFF
+            elif key == "crc_init":
+                init = _as_int(raw) & 0xFFFF
+            elif key == "crc_xor_out":
+                xor_out = _as_int(raw) & 0xFFFF
+            elif key == "crc_reflect_in":
+                refin = bool(raw)
+            elif key == "crc_reflect_out":
+                refout = bool(raw)
+            elif key == "crc_store":
+                text = str(raw).lower()
+                if text not in ("big", "little"):
+                    raise ValueError('expected "big" or "little"')
+                big = text == "big"
+        except Exception as exc:                       # noqa: BLE001
+            problems.append(f"bad {key}={raw!r}: {exc}; keeping base value")
+
+    custom = Crc16Params("CUSTOM", poly, init, refin, refout, xor_out, big)
+
+    # A custom set that happens to reproduce a standard one is worth saying so:
+    # it means the operator has typed out a variant that already had a name,
+    # and the log should let them recognise it.
+    for candidate in CATALOG:
+        if (candidate.poly, candidate.init, candidate.reflect_in,
+                candidate.reflect_out, candidate.xor_out) == \
+                (poly, init, refin, refout, xor_out):
+            custom = Crc16Params(f"CUSTOM ({candidate.name})", poly, init,
+                                 refin, refout, xor_out, big)
+            break
+    return custom, problems
+
+
+def describe(params: Crc16Params, crc_start: int = 4) -> str:
+    """One line naming every parameter that decides acceptance."""
+    order = "big" if params.big_endian_store else "little"
+    return (f"{params.name}: poly=0x{params.poly:04X} init=0x{params.init:04X} "
+            f"refin={params.reflect_in} refout={params.reflect_out} "
+            f"xorout=0x{params.xor_out:04X} store={order}-endian, "
+            f"covers packet[{crc_start}:crc]")

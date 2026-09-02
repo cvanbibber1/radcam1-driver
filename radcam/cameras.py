@@ -55,6 +55,12 @@ class CameraEntry:
     active_high: bool = True
     i2c_bus: int = -1
     present: bool = False
+    #: True when the camera's enable line is not ours to switch because it is
+    #: permanently powered - held by the kernel's camera regulator, or tied
+    #: high on the board. Such a camera is always on, so the interlock treats
+    #: it as the selected one by default and never claims its GPIO. Only one
+    #: always-on camera may be configured, for the obvious reason.
+    always_on: bool = False
     #: False when the enable line is held by something else - the kernel's
     #: camera regulator, most often. Such a camera is reported but cannot be
     #: switched, which is worth saying out loud rather than failing silently.
@@ -66,7 +72,8 @@ class CameraEntry:
                 + (f" ({self.name})" if self.name else "")
                 + f" enable GPIO{self.gpio}"
                 + (" active-low" if not self.active_high else "")
-                + (f" i2c-{self.i2c_bus}" if self.i2c_bus >= 0 else ""))
+                + (f" i2c-{self.i2c_bus}" if self.i2c_bus >= 0 else "")
+                + (" always-on" if self.always_on else ""))
 
 
 class CameraSelector:
@@ -74,8 +81,10 @@ class CameraSelector:
 
     def __init__(self, entries: list[CameraEntry] | None = None,
                  chip: str = "/dev/gpiochip0",
-                 consumer: str = "radcam-camsel"):
+                 consumer: str = "radcam-camsel",
+                 default_camera: int = NO_CAMERA):
         self.chip = chip
+        self.default_camera = default_camera
         self.consumer = consumer
         self.entries: dict[int, CameraEntry] = {}
         for entry in (entries or []):
@@ -115,6 +124,14 @@ class CameraSelector:
         self._requests = {}
         claimed, blocked = [], []
         for entry in sorted(self.entries.values(), key=lambda e: e.index):
+            if entry.always_on:
+                # Nothing to claim: this camera's supply is not ours. Asking
+                # for the line would fail against the kernel regulator holding
+                # it, and succeeding would be worse - we would then be able to
+                # power down the only camera in the payload.
+                entry.controllable = False
+                entry.blocked_by = "always on (not switchable by design)"
+                continue
             off = Value.INACTIVE if entry.active_high else Value.ACTIVE
             try:
                 self._requests[entry.index] = gpiod.request_lines(
@@ -141,13 +158,32 @@ class CameraSelector:
                         "should use free GPIOs.", len(blocked))
 
         self._active = NO_CAMERA
-        if not claimed:
+        always = self._always_on_index()
+        if always != NO_CAMERA:
+            # An always-on camera is on right now whatever we do, so reporting
+            # anything else as active would be a lie to the ground.
+            self._active = always
+            log.info("camera %d is always on and is the active camera",
+                     always)
+        elif self.default_camera != NO_CAMERA:
+            if not self.select(int(self.default_camera)):
+                log.error("default camera %d could not be selected",
+                          self.default_camera)
+
+        if not claimed and always == NO_CAMERA:
             log.error("no camera enable lines could be claimed; "
                       "selection unavailable")
             return False
-        log.info("camera selector ready: %d of %d camera(s) controllable, "
-                 "all disabled", len(claimed), len(self.entries))
+        log.info("camera selector ready: %d of %d camera(s) switchable, "
+                 "active camera %s", len(claimed), len(self.entries),
+                 "none" if self._active == NO_CAMERA else self._active)
         return True
+
+    def _always_on_index(self) -> int:
+        for index in sorted(self.entries):
+            if self.entries[index].always_on:
+                return index
+        return NO_CAMERA
 
     def close(self) -> None:
         if not self._requests:
@@ -182,13 +218,16 @@ class CameraSelector:
 
     def disable_all(self) -> None:
         if not self._requests:
+            self._active = self._always_on_index()
             return
         for entry in self.entries.values():
+            if entry.always_on:
+                continue
             try:
                 self._drive(entry, False)
             except Exception as exc:                   # noqa: BLE001
                 log.error("disabling cam%d failed: %s", entry.index, exc)
-        self._active = NO_CAMERA
+        self._active = self._always_on_index()
 
     def select(self, index: int, settle_s: float = 0.05) -> bool:  # noqa: C901
         """Disable every camera, then enable exactly one.
@@ -197,14 +236,34 @@ class CameraSelector:
         Disables always happen first, so a failure part-way through leaves the
         fabric quiet rather than contended.
         """
-        if not self._requests:
-            return False
-        if index != NO_CAMERA and index not in self._requests:
+        always = self._always_on_index()
+        if index != NO_CAMERA and index not in self.entries:
             log.warning("no camera configured at index %d", index)
+            self.failures += 1
+            return False
+        if index != NO_CAMERA and index not in self._requests and \
+                index != always:
+            log.warning("camera %d is not switchable: %s", index,
+                        self.entries[index].blocked_by or "no line claimed")
+            self.failures += 1
+            return False
+        if always != NO_CAMERA and index != always:
+            # Refuse rather than half-do it. Turning the others on while an
+            # always-on camera cannot be turned off is exactly the contention
+            # this class exists to prevent.
+            log.error("cannot select camera %s: camera %d is always on and "
+                      "cannot be disabled", index, always)
             self.failures += 1
             return False
 
         self.disable_all()
+        if index == always and index != NO_CAMERA:
+            self._active = index
+            self.selections += 1
+            log.info("camera %d selected (always on)", index)
+            return True
+        if not self._requests:
+            return False
         if index == NO_CAMERA:
             log.info("all cameras disabled")
             self.selections += 1
@@ -239,7 +298,7 @@ class CameraSelector:
 
     def summary(self) -> dict:
         return {
-            "camera_count": len(self._requests) or len(self.entries),
+            "camera_count": len(self.entries) or len(self._requests),
             "camera_active": self._active,
             "camera_selections": self.selections,
             "camera_select_failures": self.failures,
@@ -248,7 +307,8 @@ class CameraSelector:
     def pack_table(self) -> bytes:
         """The camera table for the ground: 6 bytes per entry, little-endian.
 
-        index u8, gpio u8, flags u8 (bit0 active-high, bit1 currently enabled),
+        index u8, gpio u8, flags u8 (bit0 active-high, bit1 currently enabled,
+        bit2 always-on and therefore not switchable),
         i2c_bus i8, name length u8, then that many name bytes.
         """
         import struct
@@ -257,7 +317,8 @@ class CameraSelector:
         for index in sorted(self.entries):
             entry = self.entries[index]
             flags = (0x01 if entry.active_high else 0) | \
-                    (0x02 if index == self._active else 0)
+                    (0x02 if index == self._active else 0) | \
+                    (0x04 if entry.always_on else 0)
             name = entry.name.encode("ascii", "replace")[:16]
             out += struct.pack("<BBBbB", entry.index, entry.gpio & 0xFF,
                                flags, entry.i2c_bus, len(name)) + name
@@ -274,7 +335,8 @@ def entries_from_config(raw: list | None) -> list[CameraEntry]:
                 gpio=int(item["gpio"]),
                 name=str(item.get("name", "")),
                 active_high=bool(item.get("active_high", True)),
-                i2c_bus=int(item.get("i2c_bus", -1))))
+                i2c_bus=int(item.get("i2c_bus", -1)),
+                always_on=bool(item.get("always_on", False))))
         except Exception as exc:                       # noqa: BLE001
             log.error("bad camera entry %r: %s", item, exc)
     return out
