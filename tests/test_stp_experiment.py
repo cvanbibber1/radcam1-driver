@@ -584,3 +584,63 @@ class TestTimebase(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HrtInitialGo(ExperimentFixture):
+    """Coming up with the tap already open.
+
+    Off by default and it must stay that way: the ICD's initial HRT state is
+    stop, and a slave that transmits before being asked can talk over whichever
+    experiment DICE is actually listening to. These tests pin both the default
+    and the opt-in, because a regression in either direction is expensive - one
+    breaks a bench test, the other misbehaves on a shared bus.
+    """
+
+    def build(self, **kwargs):
+        from tests.support import FakeMediaStore, MemoryLink
+        link = MemoryLink()
+        store = FakeMediaStore()
+        exp = Experiment(
+            link=link, wire=self.wire,
+            dispatcher=Dispatcher(config=ProtoConfig(), store=store),
+            store=store,
+            config=ExperimentConfig(target_id=TARGET, scrub_interval_s=3600,
+                                    **kwargs))
+        exp.start()
+        self.addCleanup(exp.stop)
+        return exp, link
+
+    def test_default_is_stopped(self):
+        exp, link = self.build()
+        self.assertFalse(exp._hrt_enabled.value())
+        exp.service()
+        self.assertEqual(link.dice_read(), b"")
+
+    def test_initial_go_transmits_without_a_go_packet(self):
+        exp, link = self.build(hrt_initial_go=True, hrt_idle_fill=True)
+        self.assertTrue(exp._hrt_enabled.value())
+        exp.service()
+        sent = link.dice_read()
+        self.assertGreater(len(sent), 0)
+        self.assertEqual(len(sent) % P.HRT_DATA_PACKET_SIZE, 0)
+        self.assertEqual(sent[4], P.PacketType.HRT_DATA)
+
+    def test_a_stop_still_closes_a_tap_that_opened_itself(self):
+        exp, link = self.build(hrt_initial_go=True, hrt_idle_fill=True)
+        link.dice_send(P.encode_short_request(P.PacketType.HRT_STOP,
+                                              1000, 5, self.wire, TARGET))
+        exp.service()
+        link.dice_read()
+        exp.service()
+        self.assertEqual(link.dice_read(), b"")
+        self.assertFalse(exp._hrt_enabled.value())
+
+    def test_the_boot_state_is_reported_in_telemetry(self):
+        exp, link = self.build(hrt_initial_go=True)
+        link.dice_send(P.encode_short_request(P.PacketType.LRT_REQUEST,
+                                              1000, 5, self.wire, TARGET))
+        exp.service()
+        raw = link.dice_read()
+        at = raw.find(self.wire.sync_bytes)
+        telemetry = L.decode_lrt_payload(raw[at + 6:at + 6 + 1248])
+        self.assertTrue(telemetry["hrt_enabled"])

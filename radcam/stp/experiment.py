@@ -140,6 +140,21 @@ class ExperimentConfig:
     #: Emit an idle HRT packet when the tap is open but nothing is queued.
     #: Off by default: the ICD does not require it and it wastes bus time.
     hrt_idle_fill: bool = False
+    #: Come up with the HRT tap already open, as though DICE had sent Go.
+    #:
+    #: **Off by default, and it should stay off in flight.** The payload is a
+    #: slave on a bus shared with up to five other experiments; transmitting
+    #: before being asked can talk over whichever one DICE is listening to,
+    #: and the ICD's initial HRT state is stop. It exists because on a
+    #: dedicated link - bench bring-up, a single-experiment test - waiting for
+    #: a Go that the ground has to remember to send is friction with no
+    #: safety value.
+    hrt_initial_go: bool = False
+    #: Start the live video encoder as soon as the experiment comes up, rather
+    #: than waiting for STREAM_START. Costs CPU and power from boot, which is
+    #: why it is opt-in, but it removes the multi-second encoder spin-up from
+    #: the first frame the ground sees.
+    stream_autostart: bool = False
     #: Data chunks per XOR parity chunk, on both the HRT and LRT paths.
     #: 6.25% overhead at the default of 16; 0 disables it.
     fec_group_size: int = DEFAULT_GROUP_SIZE
@@ -200,7 +215,11 @@ class Experiment:
             self.dispatcher.store = store
 
         # -- state that must survive a bit flip ---------------------------
-        self._hrt_enabled = TMRBool(False, "hrt_enabled")
+        # The ICD's initial state is stop, and that is the default. When the
+        # mission opts into hrt_initial_go the tap starts open, so the first
+        # HRT packet does not wait on a Go the ground may never send.
+        self._hrt_enabled = TMRBool(bool(self.cfg.hrt_initial_go),
+                                    "hrt_enabled")
         self._safe_mode = TMRBool(False, "safe_mode")
         self._cmds_received = TMRInt(0, 4, "cmds_received")
         self._cmds_executed = TMRInt(0, 4, "cmds_executed")
@@ -494,6 +513,38 @@ class Experiment:
         self.scrubber.start()
         self.events.add(L.EventCode.BOOT, arg=self.cfg.boot_count)
         log.info("STP experiment up as target 0x%02X", self.cfg.target_id)
+
+        if self.cfg.hrt_initial_go:
+            self.events.add(L.EventCode.HRT_GO)
+            log.warning("HRT starts ENABLED (hrt_initial_go): the payload will "
+                        "transmit without waiting for a Go from DICE")
+        if self.cfg.stream_autostart:
+            self._autostart_stream()
+
+    def _autostart_stream(self) -> None:
+        """Bring the encoder up at boot, as though STREAM_START had arrived.
+
+        Failure is logged and recorded as an event but never raised: a camera
+        that will not start must not stop the experiment coming up, because a
+        payload that answers telemetry and explains why it has no video is far
+        more useful than one that never reaches the bus.
+        """
+        if self.stream is None:
+            log.warning("stream_autostart set but no stream is configured")
+            return
+        try:
+            started = self.stream.start(self.stream.config.sanitised())
+        except Exception as exc:                       # noqa: BLE001
+            log.error("stream autostart raised: %s", exc)
+            started = False
+        if started:
+            cfg = self.stream.config
+            self.events.add(L.EventCode.RECORD_STARTED, arg=cfg.width)
+            log.info("live stream autostarted: %dx%d@%dfps %d bit/s",
+                     cfg.width, cfg.height, cfg.fps, cfg.bitrate)
+        else:
+            self.events.add(L.EventCode.CAPTURE_FAILED, severity=L.SEV_ERROR)
+            log.error("live stream autostart failed; STREAM_START can retry")
 
     def stop(self) -> None:
         self._running.clear()

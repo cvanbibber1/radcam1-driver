@@ -319,6 +319,8 @@ class Daemon:
                 max_command_queue=int(cfg.get("max_command_queue", 4)),
                 safe_mode_threshold=int(cfg.get("safe_mode_threshold", 5)),
                 hrt_idle_fill=bool(cfg.get("hrt_idle_fill", False)),
+                hrt_initial_go=bool(cfg.get("hrt_initial_go", False)),
+                stream_autostart=bool(cfg.get("stream_autostart", False)),
                 scrub_interval_s=float(cfg.get("scrub_interval_s", 30.0)),
                 log_rx=bool(cfg.get("log_rx", False)),
                 rx_capture=str(cfg.get("rx_capture", "")),

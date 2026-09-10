@@ -60,10 +60,14 @@ KEYS = {
     "de_active_high": "de_active_high",
     "hrt_packets_per_service": "hrt_packets_per_service",
     "log_rx": "log_rx",
+    "hrt_idle_fill": "hrt_idle_fill",
+    "hrt_initial_go": "hrt_initial_go",
+    "stream_autostart": "stream_autostart",
 }
 
 _BOOL = {"crc_reflect_in", "crc_reflect_out", "big_endian", "de_control",
-         "de_active_high", "log_rx"}
+         "de_active_high", "log_rx", "hrt_idle_fill", "hrt_initial_go",
+         "stream_autostart"}
 _INT = {"crc_poly", "crc_init", "crc_xor_out", "crc_start", "target_id",
         "baud", "de_gpio", "hrt_packets_per_service"}
 _ENUM = {"crc_store": ("big", "little"), "lrt_trailer": ("crc", "zero")}
@@ -106,6 +110,14 @@ def cmd_show(args) -> int:
     de = "released to hardware (de_control false)" if not stp.get("de_control", True) \
         else f"driven on GPIO{stp.get('de_gpio', 4)}"
     print(f"  DE               {de}")
+    hrt = []
+    if stp.get("hrt_initial_go"):
+        hrt.append("starts ENABLED without a Go")
+    if stp.get("stream_autostart"):
+        hrt.append("stream autostarts")
+    if stp.get("hrt_idle_fill"):
+        hrt.append("idle fill on")
+    print(f"  HRT              {', '.join(hrt) if hrt else 'stopped until Go (ICD default)'}")
     print(f"\n  CRC              {crcmod.describe(wire.crc, wire.crc_start)}")
     for problem in problems:
         print(f"  !! {problem}")

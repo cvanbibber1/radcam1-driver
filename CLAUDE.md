@@ -292,6 +292,12 @@ failures, decodes with no errors.
 `rpicam-vid --codec yuv420 | ffmpeg -c:v libx264`, run with
 `sliced-threads=0:threads=1`.
 
+`hrt_initial_go` and `stream_autostart` bring the payload up already
+transmitting live video, with no `HRT Go` and no `STREAM_START`. Both are bench
+conveniences for a dedicated link — **`hrt_initial_go` must be off in flight**,
+because a slave that transmits before being asked talks over whichever
+experiment DICE is listening to. A `Stop` still closes a tap that opened itself.
+
 **A stream drops, it never queues.** Bounded ring, oldest discarded, flushed
 when HRT closes — buffering would turn a bandwidth shortfall into unbounded
 latency. Live video preempts file transfer; file chunks use the gaps between

@@ -140,6 +140,40 @@ sudo tools/rs422-tweak.py set lrt_trailer=crc --restart
 | `de_control` | `false` | **See the warning below.** |
 | `de_gpio` | `4` | |
 | `log_rx` | `true` | raw receive capture to `/var/log/radcam/rx.bin` |
+| `hrt_idle_fill` | `true` | answer an open tap with idle packets when nothing is queued |
+| `hrt_initial_go` | `true` | **come up transmitting, without waiting for a Go** — see below |
+| `stream_autostart` | `true` | start the video encoder at boot, not on `STREAM_START` |
+
+### HRT at boot
+
+By default the payload comes up with HRT **stopped**, which is what the ICD
+specifies, and waits for `HRT Go`. Two settings change that:
+
+```bash
+sudo tools/rs422-tweak.py set hrt_initial_go=true stream_autostart=true --restart
+```
+
+`hrt_initial_go` opens the tap at startup as though a Go had arrived.
+`stream_autostart` brings the encoder up at the same time, so live video is on
+the wire a second after boot instead of waiting for two commands the operator
+has to remember.
+
+> ⚠️ **Turn `hrt_initial_go` off for flight.** The payload is a slave on a bus
+> shared with up to five other experiments, and transmitting before being asked
+> can talk over whichever one DICE is actually listening to. It is a bench
+> convenience on a dedicated link, not a flight setting. A `Stop` still closes
+> a tap that opened itself, so the ground is never without a way to silence us.
+
+`hrt_idle_fill` is worth knowing about separately: with it off, an open tap and
+nothing queued produces **no packets at all**, which looks exactly like a broken
+payload. With it on, a Go always yields visible HRT traffic. Once real video is
+flowing you can turn it off rather than spending link on zeros.
+
+`tools/rs422-tweak.py show` prints the resulting state on one line:
+
+```
+  HRT              starts ENABLED without a Go, stream autostarts, idle fill on
+```
 
 ### ⚠️ `de_control` — the setting that silently kills the transmitter
 
