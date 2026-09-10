@@ -201,7 +201,15 @@ class CameraSelector:
 
     @property
     def is_open(self) -> bool:
-        return bool(self._requests)
+        """True when this selector can answer for the payload's cameras.
+
+        Not the same question as "did we claim any GPIO lines". A payload whose
+        only camera is always on claims nothing and is still perfectly able to
+        report what it has and confirm which one is active - and refusing to
+        answer CAMERA_LIST there would leave the ground unable to see the one
+        camera it is looking through.
+        """
+        return bool(self._requests) or self._always_on_index() != NO_CAMERA
 
     def controllable(self) -> list:
         """Indices this selector can actually switch."""

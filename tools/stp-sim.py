@@ -379,9 +379,29 @@ def build_in_process(target_id: int, wire: P.Wire):
 
     bus = MemoryBus()
     store = FakeStore()
+
+    # Slots and a camera table, so the sim answers the commands a ground
+    # station actually sends. Without them SLOT_* and CAMERA_* fail here while
+    # working on the payload, which is the wrong way round for a tool whose
+    # whole purpose is developing the ground station without hardware.
+    import tempfile
+    from radcam.slots import SlotStore
+    from radcam.cameras import CameraSelector, CameraEntry
+
+    slots = SlotStore(directory=tempfile.mkdtemp(prefix="stp-sim-slots-"))
+
+    cameras = CameraSelector([
+        CameraEntry(index=0, gpio=48, name="AR1335", i2c_bus=4,
+                    always_on=True)])
+    # The flight board's camera is powered by the kernel regulator and claims
+    # no line, so mirror that state directly rather than calling open(), which
+    # would need a real gpiochip.
+    cameras._active = cameras._always_on_index()
+
     experiment = Experiment(
         link=bus, wire=wire, dispatcher=Dispatcher(config=ProtoConfig()),
-        store=store, config=ExperimentConfig(target_id=target_id))
+        store=store, slots=slots, cameras=cameras,
+        config=ExperimentConfig(target_id=target_id))
     experiment.start()
     return bus, experiment, store
 

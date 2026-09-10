@@ -272,7 +272,7 @@ class SlotStore:
         }
 
     def pack_table(self) -> bytes:
-        """The whole table, for SLOT_LIST. 20 bytes per slot, little-endian."""
+        """The whole table, for SLOT_LIST. 22 bytes per slot, little-endian."""
         import struct
         out = bytearray(struct.pack("<BB", self.count, len(self.occupied())))
         for slot in self.list():

@@ -141,3 +141,78 @@ class AlwaysOnCamera(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AlwaysOnCameraOverTheLink(unittest.TestCase):
+    """The camera commands, exercised through the real state machine.
+
+    Testing `is_open` directly would not have caught the bug this class exists
+    for: the property was self-consistent, and only the dispatcher's use of it
+    as a gate made an always-on payload refuse to describe its own camera. So
+    these go in through a command packet and read the response window, the way
+    the ground does.
+    """
+
+    def setUp(self):
+        from tests.support import FakeMediaStore, MemoryLink
+        from radcam.protocol import Config as ProtoConfig, Dispatcher
+        from radcam.stp import packets as P
+        from radcam.stp.experiment import Experiment, ExperimentConfig
+
+        self.P = P
+        self.wire = P.Wire(target_id=0xC7)
+        self.link = MemoryLink()
+        self.cameras = CameraSelector(
+            [CameraEntry(0, 48, "AR1335", i2c_bus=4, always_on=True)])
+        self.cameras.open()
+        store = FakeMediaStore()
+        self.experiment = Experiment(
+            link=self.link, wire=self.wire,
+            dispatcher=Dispatcher(config=ProtoConfig(), store=store),
+            store=store, cameras=self.cameras,
+            config=ExperimentConfig(target_id=0xC7, scrub_interval_s=3600))
+        self.experiment.start()
+
+    def tearDown(self):
+        self.experiment.stop()
+
+    def response_to(self, opcode, args=b""):
+        from radcam.stp import lrt as L
+        from radcam.stp.commands import encode_command_payload
+        from tests.support import drain_experiment
+
+        payload = encode_command_payload(opcode, 1, args, 0)
+        self.link.dice_send(
+            self.P.encode_command(payload, 1000, 5, self.wire, 0xC7))
+        self.experiment.service()
+        drain_experiment(self.experiment, passes=4)
+        self.link.dice_read()
+        self.link.dice_send(
+            self.P.encode_short_request(self.P.PacketType.LRT_REQUEST,
+                                        1000, 5, self.wire, 0xC7))
+        self.experiment.service()
+        raw = self.link.dice_read()
+        at = raw.find(self.wire.sync_bytes)
+        return L.decode_lrt_payload(raw[at + 6:at + 6 + 1248])
+
+    def test_camera_list_is_answered(self):
+        from radcam.stp.experiment import StpOp
+        telemetry = self.response_to(StpOp.CAMERA_LIST)
+        self.assertEqual(telemetry["last_result"], 0)
+        table = telemetry["resp_data"]
+        self.assertEqual(table[0], 1)                 # one camera
+        self.assertEqual(table[1], 0)                 # camera 0 active
+        self.assertTrue(table[4] & 0x04)              # always-on flag
+        self.assertIn(b"AR1335", table)
+
+    def test_selecting_the_always_on_camera_succeeds(self):
+        from radcam.stp.experiment import StpOp
+        telemetry = self.response_to(StpOp.SELECT_CAMERA, b"\x00")
+        self.assertEqual(telemetry["last_result"], 0)
+        self.assertEqual(telemetry["camera_active"], 0)
+
+    def test_telemetry_reports_the_camera_without_being_asked(self):
+        from radcam.protocol import Msg
+        telemetry = self.response_to(Msg.PING)
+        self.assertEqual(telemetry["camera_count"], 1)
+        self.assertEqual(telemetry["camera_active"], 0)
