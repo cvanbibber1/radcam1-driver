@@ -260,3 +260,83 @@ class TestPacketReader(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class IgnoredPacketTypes(unittest.TestCase):
+    """Packets we do not act on still have to be consumed, not stepped over.
+
+    The flight computer sends health-and-status (0xA0) once per LRT poll and a
+    16-byte packet (0xEC) occasionally. Neither needs a reply. But a type with
+    no registered length forces the receiver to skip one sync and rescan, and
+    on real captured traffic that cost 963 framing errors, 1025 resyncs and
+    127 lost LRT requests - and an HRT Go or Stop arriving inside one of those
+    windows goes with them. Knowing a packet's length matters even when its
+    meaning does not.
+    """
+
+    def setUp(self):
+        from radcam.stp.rx import PacketReader
+        self.wire = P.Wire(target_id=0xC7)
+        self.reader = PacketReader(self.wire)
+
+    def health_packet(self):
+        return P.encode_short_request(P.PacketType.HEALTH_STATUS,
+                                      1000, 5, self.wire, 0xC7)
+
+    def test_health_status_is_consumed_whole(self):
+        packets = self.reader.feed(self.health_packet())
+        self.assertEqual(packets, [])
+        self.assertEqual(self.reader.stats.ignored, 1)
+        self.assertEqual(self.reader.stats.resyncs, 0)
+        self.assertEqual(self.reader.stats.unknown_type, 0)
+        self.assertEqual(self.reader.pending_bytes, 0)
+
+    def test_flow_control_behind_health_status_still_arrives(self):
+        # The regression: the Go must survive the packet in front of it.
+        stream = self.health_packet() + P.encode_short_request(
+            P.PacketType.HRT_GO, 1000, 6, self.wire, 0xC7)
+        packets = self.reader.feed(stream)
+        self.assertEqual([p.packet_type for p in packets],
+                         [P.PacketType.HRT_GO])
+        self.assertEqual(self.reader.stats.resyncs, 0)
+
+    def test_the_captured_alternation_costs_nothing(self):
+        stream = b""
+        for i in range(20):
+            stream += self.health_packet()
+            stream += P.encode_short_request(P.PacketType.LRT_REQUEST,
+                                             1000, i, self.wire, 0xC7)
+        packets = []
+        for i in range(0, len(stream), 7):        # awkward chunking on purpose
+            packets += self.reader.feed(stream[i:i + 7])
+        self.assertEqual(len(packets), 20)
+        self.assertEqual(self.reader.stats.resyncs, 0)
+        self.assertEqual(self.reader.stats.dropped_bytes, 0)
+        self.assertEqual(self.reader.stats.ignored, 20)
+
+    def test_a_corrupted_type_byte_cannot_eat_the_packet_behind_it(self):
+        # 0xA0 with a broken CRC must not be trusted to be 14 bytes long.
+        bad = bytearray(self.health_packet())
+        bad[-1] ^= 0xFF
+        good = P.encode_short_request(P.PacketType.LRT_REQUEST,
+                                      1000, 9, self.wire, 0xC7)
+        packets = self.reader.feed(bytes(bad) + good)
+        self.assertEqual([p.packet_type for p in packets],
+                         [P.PacketType.LRT_REQUEST])
+        self.assertEqual(self.reader.stats.bad_crc, 1)
+        self.assertEqual(self.reader.stats.ignored, 0)
+
+    def test_sixteen_byte_packet_is_consumed_whole(self):
+        packet = bytearray(16)
+        packet[0:4] = self.wire.sync_bytes
+        packet[10] = P.PacketType.UNKNOWN_16
+        packet[11] = 0xC7
+        packet[12:14] = b"\xc7\x00"
+        sealed = self.wire.seal(packet, 14)
+        follow = P.encode_short_request(P.PacketType.HRT_STOP,
+                                        1000, 3, self.wire, 0xC7)
+        packets = self.reader.feed(sealed + follow)
+        self.assertEqual([p.packet_type for p in packets],
+                         [P.PacketType.HRT_STOP])
+        self.assertEqual(self.reader.stats.ignored, 1)
+        self.assertEqual(self.reader.stats.resyncs, 0)

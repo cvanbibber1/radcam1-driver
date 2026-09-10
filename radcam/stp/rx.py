@@ -32,6 +32,7 @@ from .packets import (
     DEFAULT_WIRE, PacketError, SHORT_PACKET_TYPE_OFFSET, Wire,
     decode_command, decode_short_request, rx_length_for_type,
     COMMAND_PACKET_SIZE, SHORT_REQUEST_SIZE, PacketType,
+    IGNORED_RX_TYPES,
 )
 
 log = logging.getLogger(__name__)
@@ -53,6 +54,10 @@ class RxStats:
     unknown_type: int = 0
     resyncs: int = 0
     dropped_bytes: int = 0
+    #: Correctly framed packets addressed to us that need no action - health
+    #: and status, and the flight computer's 16-byte packet. Counted apart
+    #: from unknown_type so that a genuinely unrecognised packet still shows.
+    ignored: int = 0
 
     def as_dict(self) -> dict[str, int]:
         return {
@@ -60,6 +65,7 @@ class RxStats:
             "bad_format": self.bad_format, "not_for_us": self.not_for_us,
             "unknown_type": self.unknown_type, "resyncs": self.resyncs,
             "dropped_bytes": self.dropped_bytes,
+            "ignored": self.ignored,
         }
 
 
@@ -131,14 +137,33 @@ class PacketReader:
             length = rx_length_for_type(packet_type)
 
             if length is None:
-                # H&S, File Transfer, or a corrupted type byte. We do not know
-                # how long it is, so step past this sync and hunt again.
+                # A type we have no length for - a corrupted type byte, or a
+                # packet class nobody has told us about. We do not know how
+                # long it is, so step past this sync and hunt again. Every one
+                # of these costs a resync, which is why any type seen
+                # regularly on the wire belongs in RX_LENGTHS even when we
+                # have nothing to do with it.
                 self.stats.unknown_type += 1
                 self._skip_one_sync()
                 continue
 
             if len(self._buf) < length:
                 return out               # wait for the rest of the packet
+
+            if packet_type in IGNORED_RX_TYPES:
+                # Addressed to us, correctly framed, and requiring no action.
+                # Consume it whole so the next packet starts at a sync we
+                # trust - the CRC is still checked first, because a corrupted
+                # type byte that lands on one of these values must not be
+                # allowed to eat the bytes of a real packet behind it.
+                candidate = bytes(self._buf[:length])
+                if not self.wire.check_crc(candidate, length - 2):
+                    self.stats.bad_crc += 1
+                    self._skip_one_sync()
+                    continue
+                del self._buf[:length]
+                self.stats.ignored += 1
+                continue
 
             candidate = bytes(self._buf[:length])
             packet = self._decode(candidate, packet_type)

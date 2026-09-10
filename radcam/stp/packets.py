@@ -56,6 +56,15 @@ class PacketType:
     HRT_STOP_WITH_LOSS = 0x86
     HRT_GO = 0x87
     HRT_DATA = 0x87
+    #: Health and status, 14 bytes, sent to us but requiring no reply.
+    #: Not in the ICD excerpts we hold - read off the wire, where it
+    #: alternates one-for-one with the LRT Request.
+    HEALTH_STATUS = 0xA0
+    #: A 16-byte packet the flight computer sends occasionally, carrying two
+    #: payload bytes. Its meaning is unknown and it needs no reply; its
+    #: *length* is known from captured traffic and that is what matters here,
+    #: because a packet whose length we cannot predict costs a resync.
+    UNKNOWN_16 = 0xEC
 
 
 SYNC_WORD_1 = 0x1ACF
@@ -113,7 +122,19 @@ RX_LENGTHS: dict[int, int] = {
     PacketType.HRT_STOP: SHORT_REQUEST_SIZE,
     PacketType.HRT_STOP_WITH_LOSS: SHORT_REQUEST_SIZE,
     PacketType.HRT_GO: SHORT_REQUEST_SIZE,
+    # Known length, no reply. Registering these is not cosmetic: an unknown
+    # type forces the receiver to resync and rescan, and a flow-control packet
+    # arriving inside that window can be lost with it.
+    PacketType.HEALTH_STATUS: SHORT_REQUEST_SIZE,
+    PacketType.UNKNOWN_16: 16,
 }
+
+#: Received types that are addressed to us, framed correctly, and require no
+#: action. Kept apart from the unknown-type count so that a genuinely
+#: unrecognised packet still stands out in telemetry.
+IGNORED_RX_TYPES: frozenset[int] = frozenset({
+    PacketType.HEALTH_STATUS, PacketType.UNKNOWN_16,
+})
 
 
 def rx_length_for_type(packet_type: int) -> int | None:
@@ -155,6 +176,12 @@ class Wire:
     #: expected setting. "zero" is retained purely for interoperability
     #: testing against a non-conforming peer.
     lrt_trailer: str = "crc"          # "crc" or "zero"
+    #: Packet type stamped on an outgoing HRT Data packet. The ICD says 0x87
+    #: and that is the default. It is settable because the request that draws
+    #: the packet is 0xA0, and a peer that mirrors its request type the way
+    #: LRT does would want 0xA0 here instead - which is a config change rather
+    #: than a rebuild.
+    hrt_data_type: int = 0x87
 
     # -- helpers ---------------------------------------------------------
 
@@ -354,7 +381,7 @@ def encode_hrt_data(payload: bytes, wire: Wire = DEFAULT_WIRE,
 
     packet = bytearray(HRT_DATA_PACKET_SIZE)
     packet[0:4] = wire.sync_bytes
-    packet[HRT_DATA_PACKET_TYPE_OFFSET] = PacketType.HRT_DATA
+    packet[HRT_DATA_PACKET_TYPE_OFFSET] = wire.hrt_data_type & 0xFF
     packet[HRT_DATA_TARGET_ID_OFFSET] = tid & 0xFF
     packet[HRT_DATA_OFFSET:HRT_DATA_OFFSET + len(payload)] = payload
     return wire.seal(packet, HRT_DATA_CRC_OFFSET)
