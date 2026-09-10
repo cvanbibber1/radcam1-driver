@@ -14,7 +14,7 @@ after every reboot.
 ## Mission
 
 High-reliability, zero-intervention camera + telemetry system for a space application.
-Runs unattended on a Raspberry Pi 5, eventually booting from NVMe, power-minimised.
+Runs unattended on a Raspberry Pi 5, booting from NVMe, power-minimised.
 
 ## Platform
 
@@ -28,8 +28,9 @@ Runs unattended on a Raspberry Pi 5, eventually booting from NVMe, power-minimis
 | Firmware | 2226a853 (2025/12/08) |
 | libcamera | 0.7.1+rpt20260609-1 |
 | rpicam-apps | 1.12.0-1 |
-| Root FS | microSD `mmcblk0p2` — **boots from SD**, `BOOT_ORDER=0xf461` (SD, then NVMe, then USB) |
-| NVMe | `nvme0n1`, WD Green SN3000 500GB — **partitioned, holds a stale clone** (see below) |
+| Root FS | **NVMe `nvme0n1p2`** — boots from NVMe, `BOOT_ORDER=0xf416` (NVMe, then SD, then USB) |
+| NVMe | `nvme0n1`, WD Green SN3000 500GB — **the live system**, 11 GB used of 457 GB |
+| microSD | `mmcblk0` — now the *secondary*, holding a stale 2026-08-10 clone. Harmless: NVMe boots first, and the SD is a recovery path. |
 | ISP | PiSP (`pisp_be@880000`), front end `raspberrypi,rp1-cfe` |
 
 ## Hardware map
@@ -61,12 +62,11 @@ GPIO controller for all of the above is `gpiochip0` (`pinctrl-rp1`, 54 lines).
 | Dosimeter | LTC2485IDDTRPBF (24-bit ΔΣ I2C ADC) | SDA=GPIO2, SCL=GPIO3 (`i2c-1`), ~2.5 mV/rad, needs one-time calibration persisted to storage |
 | Illumination | TPS922051D1DSGR LED driver | PWM on GPIO18, **software-capped at 10% duty** |
 
-> ⚠️ **The NVMe holds a clone from 2026-08-10 with no STP code.** It has a
-> valid `bootfs` + `rootfs` pair, and `BOOT_ORDER=0xf461` falls back to it if
-> the SD card fails to boot. That fallback would come up with no RS-422
-> protocol at all — no `radcam/stp`, no `stream.py`, no `slots.py`, and a
-> config with no `stp` section. Either refresh it or remove it from the boot
-> order before flight.
+> The roles are the reverse of what they were: the **NVMe is the live system**
+> and the **SD card holds the stale 2026-08-10 clone**. `BOOT_ORDER=0xf416`
+> tries NVMe first, so the stale copy is a fallback rather than a hazard.
+> Refresh it with `tools/flash-payload-image.sh` if you want the recovery path
+> to be a current system rather than an old one.
 
 ## Repository layout
 
@@ -358,6 +358,34 @@ tools/stp-crc-solve.py --bin capture.bin   # recover the real CRC parameters
 Enabled by `"stp": {"enabled": true}` in `/etc/radcam/config.json`. That
 replaces the flight telemetry port with a null link, so the ASCII beacon
 **cannot** reach the DICE bus, and disables the old COBS command server.
+
+## Flashing more payloads
+
+Five more cameras get built from one image; see **`docs/FLASHING.md`**.
+
+```bash
+sudo tools/build-payload-image.sh                     # ~1.2 GB .img.gz
+sudo tools/verify-payload-image.sh IMAGE              # 23 checks
+sudo tools/flash-payload-image.sh IMAGE /dev/sdX --unit 2 --verify
+sudo tools/set-nvme-boot.sh                           # on each new Pi
+```
+
+The image is a clone of this system with identity and per-Pi state stripped,
+and `provisioning/radcam-firstboot.sh` regenerates machine-id and SSH host
+keys, sets the hostname from `radcam-unit.txt` on the boot partition, and
+expands the root filesystem to fill the SSD.
+
+Two asymmetries worth remembering, because they are easy to get backwards:
+
+- **Camera colour calibration travels with the camera module** (it lives on the
+  module's own EEPROM), so a calibrated module carries its numbers to any unit.
+- **Dosimeter calibration belongs to the Pi** (the LTC2485 is on the Pi board),
+  so it is excluded from the image and every unit needs its own
+  `radcamctl calibrate`. A cloned dose calibration is a confidently wrong
+  number, which is worse than none.
+
+`BOOT_ORDER` lives in the Pi's SPI EEPROM and no disk image can carry it — a
+perfect SSD in a Pi that still tries SD first looks exactly like a bad flash.
 
 ## libcamera
 

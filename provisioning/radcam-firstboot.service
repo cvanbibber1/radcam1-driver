@@ -1,0 +1,22 @@
+[Unit]
+Description=radcam payload first-boot provisioning
+# Must finish before anything that cares about identity or disk size. radcamd
+# is ordered after this so its first boot-count entry belongs to the right
+# hostname and lands on an expanded filesystem.
+DefaultDependencies=no
+After=local-fs.target systemd-remount-fs.service
+Before=radcam-calibration.service radcamd.service sshd.service network-pre.target
+Wants=local-fs.target
+ConditionPathExists=!/var/lib/radcam/.firstboot-done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/radcam-firstboot.sh
+# Never block the boot on this. A payload that comes up with a stale hostname
+# is a nuisance; one that hangs waiting on provisioning is a dead camera.
+TimeoutStartSec=180
+StandardOutput=journal+console
+
+[Install]
+WantedBy=sysinit.target
